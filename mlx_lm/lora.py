@@ -18,6 +18,7 @@ from .tokenizer_utils import TokenizerWrapper
 from .tuner.datasets import load_dataset
 from .tuner.trainer import TrainingArgs, TrainingCallback, evaluate, train
 from .tuner.grpo_trainer import GRPOTrainingArgs, evaluate_grpo, train_grpo
+from .tuner.callbacks import WandBCallback
 from .tuner.utils import (
     build_schedule,
     linear_to_lora_layers,
@@ -72,6 +73,7 @@ CONFIG_DEFAULTS = {
     "lr_schedule": None,
     "lora_parameters": {"rank": 8, "dropout": 0.0, "scale": 10.0},
     "mask_prompt": False,
+    "wandb_project": None,
 
     # GRPO args
     "reference_model_path": None,
@@ -126,6 +128,12 @@ def build_parser():
         "--mask-prompt",
         action="store_true",
         help="Mask the prompt in the loss when training",
+        default=None,
+    )
+    parser.add_argument(
+        "--wandb-project",
+        type=str,
+        help="WandB project name to report training metrics.",
         default=None,
     )
     parser.add_argument(
@@ -407,6 +415,15 @@ def run(args, training_callback: TrainingCallback = None):
 
     print("Loading datasets")
     train_set, valid_set, test_set = load_dataset(args, tokenizer)
+
+    if args.wandb_project:
+        print(f"Using wandb project '{args.wandb_project}")
+        training_callback = WandBCallback(
+            project_name=args.wandb_project,
+            log_dir=args.adapter_path,
+            config=vars(args),
+            wrapped_callback=training_callback
+        )
 
     if args.test and not args.train:
         # Allow testing without LoRA layers by providing empty path
