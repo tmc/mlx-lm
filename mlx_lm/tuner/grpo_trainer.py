@@ -11,7 +11,7 @@ import numpy as np
 from mlx.utils import tree_flatten
 
 from ..models import cache
-from ..utils import generation_stream
+from ..generate import generation_stream
 from .grpo_reward_functions import (
     RewardFunctions,
     r1_accuracy_reward_func,

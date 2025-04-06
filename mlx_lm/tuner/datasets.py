@@ -211,6 +211,7 @@ def create_dataset(
     text_feature = getattr(config, "text_feature", "text")
     completion_feature = getattr(config, "completion_feature", "completion")
     chat_feature = getattr(config, "chat_feature", "messages")
+    answer_feature = getattr(config, "answer_feature", "answer")
     sample = data[0]
     if prompt_feature in sample and completion_feature in sample:
         return CompletionsDataset(
@@ -224,7 +225,7 @@ def create_dataset(
         if mask_prompt:
             raise ValueError("Prompt masking not supported for text dataset.")
         return TextDataset(data, tokenizer, text_key=text_feature)
-    else:
+    elif prompt_feature and answer_feature in sample:
         return GRPODataset(
             data=data,
             tokenizer=tokenizer,
@@ -232,6 +233,11 @@ def create_dataset(
             answer_key="answer",
             use_chat_template=args.use_chat_template,
             use_prompt=args.use_prompt
+        )
+    else:
+        raise ValueError(
+            "Unsupported data format, check the supported formats here:\n"
+            "https://github.com/ml-explore/mlx-examples/blob/main/llms/mlx_lm/LORA.md#data."
         )
 
 
