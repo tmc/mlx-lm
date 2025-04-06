@@ -183,7 +183,6 @@ class TransformerBlock(nn.Module):
         self.num_attention_heads = args.num_attention_heads
         self.hidden_size = args.hidden_size
         self.self_attn = Attention(args, layer_idx)
-        self.use_chunked_attention = int((layer_idx + 1) % 4 != 0)
         self.is_moe_layer = (layer_idx % args.interleave_moe_layer_step) == (
             args.interleave_moe_layer_step - 1
         )
@@ -221,6 +220,7 @@ class LlamaModel(nn.Module):
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
         self.layers = [TransformerBlock(args, i) for i in range(args.num_hidden_layers)]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.attention_chunk_size = args.attention_chunk_size
 
     def __call__(
         self,
@@ -232,12 +232,31 @@ class LlamaModel(nn.Module):
 
         if mask is None:
             mask = create_attention_mask(h, cache)
+            if cache is not None:
+                offset = cache[0].offset
+            else:
+                offset = 0
+            start = 0
+            end = offset + h.shape[1]
+            linds = mx.arange(start, end)
+            rinds = mx.arange(start + offset, end)[:, None]
+            block_pos = mx.abs(
+                (linds // self.attention_chunk_size)
+                - (rinds // self.attention_chunk_size)
+            )
+            token_pos = linds <= rinds
+            chunk_mask = (block_pos == 0) & token_pos
 
         if cache is None:
             cache = [None] * len(self.layers)
 
-        for layer, c in zip(self.layers, cache):
-            h = layer(h, mask, cache=c)
+        for idx, (layer, c) in enumerate(zip(self.layers, cache)):
+            use_chunked_attention = int((idx + 1) % 4 != 0)
+            if use_chunked_attention:
+                local_mask = chunk_mask
+            else:
+                local_mask = mask
+            h = layer(h, local_mask, cache=c)
 
         return self.norm(h)
 
