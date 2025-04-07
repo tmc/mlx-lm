@@ -115,6 +115,41 @@ def convert(
     if isinstance(quant_predicate, str):
         quant_predicate = mixed_quant_predicate_builder(quant_predicate, model)
 
+
+    if config.get("model_type") == "llama4":
+        print("[INFO] Using Llama 4 specific quantization predicate.")
+        num_layers = config["text_config"]["num_hidden_layers"] # Get num_layers from text_config
+        # Assuming SwitchGLU is used as in the draft llama4.py
+        target_patterns = [
+            ".feed_forward.experts.gate_proj",
+            ".feed_forward.experts.up_proj",
+            ".feed_forward.experts.down_proj",
+            # Add shared_expert if applicable and desired
+            # ".feed_forward.shared_expert.gate_proj",
+            # ".feed_forward.shared_expert.up_proj",
+            # ".feed_forward.shared_expert.down_proj",
+        ]
+
+        def llama4_quant_predicate(path: str, module: nn.Module, config: dict) -> Union[bool, dict]:
+            # Skip first and last layer blocks entirely
+            if path.startswith(f"language_model.model.layers.0.") or \
+               path.startswith(f"language_model.model.layers.{num_layers - 1}."):
+                 return False
+            # Check if it's one of the target MoE FFN linear layers
+            if any(p in path for p in target_patterns):
+                 # Can return True for default group/bits, or dict for custom per-layer
+                 return True
+            # Quantize only specific layer types if desired (e.g., only Linear)
+            # if not isinstance(module, (nn.Linear, nn.QuantizedLinear, SwitchLinear, QuantizedSwitchLinear)):
+            #     return False
+            # Default: Don't quantize other layers
+            return False
+        def llama4_quant_predicate_wrap(path: str, module: nn.Module, config: dict) -> Union[bool, dict]:
+            r = llama4_quant_predicate(path, module, config)
+            print(f"quant-pred: {path}: {r}")
+            return r
+        quant_predicate = llama4_quant_predicate_wrap
+
     weights = dict(tree_flatten(model.parameters()))
     dtype = getattr(mx, dtype)
     if hasattr(model, "cast_predicate"):
