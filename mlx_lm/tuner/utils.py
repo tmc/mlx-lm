@@ -103,6 +103,7 @@ def linear_to_lora_layers(
         "olmo2",
         "olmoe",
         "internlm3",
+        "llama4",
     ]:
         keys = set(["self_attn.q_proj", "self_attn.v_proj"])
         if model.model_type in ["mixtral", "phimoe"]:
@@ -112,6 +113,11 @@ def linear_to_lora_layers(
             keys.add("mlp.shared_expert_gate")
         if model.model_type == "olmoe":
             keys.add("mlp.gate")
+        if model.model_type == "llama4":
+            keys = set(["self_attn.o_proj"])
+            keys.add("feed_forward.shared_expert.gate_proj") # For Llama4 MoE shared expert
+            keys.add("feed_forward.shared_expert.up_proj") # For Llama4 MoE shared expert
+            keys.add("feed_forward.router") # Llama4 MoE router name
 
     elif model.model_type == "gpt_bigcode":
         keys = set(["attn.c_attn"])
@@ -179,8 +185,18 @@ def load_adapters(model: nn.Module, adapter_path: str) -> nn.Module:
     adapter_path = Path(adapter_path)
     if not adapter_path.exists():
         raise FileNotFoundError(f"The adapter path does not exist: {adapter_path}")
-    with open(adapter_path / "adapter_config.json", "r") as fid:
+    adapter_config_path = adapter_path / "adapter_config.json"
+    if not adapter_config_path.exists():
+         raise FileNotFoundError(f"Adapter config not found at {adapter_config_path}")
+    with open(adapter_config_path, "r") as fid:
         config = types.SimpleNamespace(**json.load(fid))
+
+    # Check if required fields are present, provide defaults or raise error
+    num_layers = getattr(config, "num_layers", -1) # Default to all layers if missing
+    lora_parameters = getattr(config, "lora_parameters", None)
+    if lora_parameters is None:
+        raise ValueError("LoRA parameters missing in adapter_config.json")
+
     fine_tune_type = getattr(config, "fine_tune_type", "lora")
     if fine_tune_type != "full":
         linear_to_lora_layers(
