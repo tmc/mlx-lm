@@ -460,7 +460,15 @@ def main():
     for k, v in CONFIG_DEFAULTS.items():
         if args.get(k, None) is None:
             args[k] = v
-    run(types.SimpleNamespace(**args))
+    if os.environ.get('MTL_CAPTURE_ENABLED', '') == 1:
+        import time
+        trace_file = f"mlx_trace.{time.time()}.gputrace"
+        mx.metal.start_capture(trace_file)
+    try:
+        run(types.SimpleNamespace(**args))
+    finally:
+        if os.environ.get('MTL_CAPTURE_ENABLED', '') == 1:
+            mx.metal.stop_capture()
 
 
 if __name__ == "__main__":
