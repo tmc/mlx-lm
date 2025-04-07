@@ -170,7 +170,7 @@ class MoE(nn.Module):
     def __call__(self, x) -> mx.array:
         logits = self.router(x)
         k = self.top_k
-        indices = mx.argpartition(-logits, kth=k - 1, axis=-1)[..., :k]
+        indices = mx.stop_gradient(mx.argpartition(-logits, kth=k - 1, axis=-1)[..., :k])
         scores = mx.take_along_axis(logits, indices, axis=-1)
         scores = mx.sigmoid(scores.astype(mx.float32)).astype(x.dtype)
 
