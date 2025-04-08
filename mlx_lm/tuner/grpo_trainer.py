@@ -496,6 +496,10 @@ def grpo_loss(
 
     # Take the minimum (pessimistic bound)
     per_token_loss = -mx.minimum(unclipped_obj, clipped_obj)
+    
+    # Calculate clip fraction for reporting
+    is_clipped = mx.not_equal(unclipped_obj, clipped_obj)
+    clip_fraction = (is_clipped * length_mask).sum() / (length_mask.sum() + epsilon)
 
     # Add KL penalty if beta is non-zero
     if beta != 0.0:
@@ -560,6 +564,7 @@ def grpo_loss(
         "grouped_rewards_std": mx.mean(grouped_rewards_std),
         "completion_mean_length": mx.mean(completion_lengths).item(),
         "completion_max_length": mx.max(completion_lengths).item() if completion_lengths.size > 0 else 0,
+        "clip_fraction": clip_fraction.item(),
         "kl": mean_kl,
         **reward_metrics,
     }
@@ -883,7 +888,9 @@ def train_grpo(
                     f"Val total_rewards_std {val_metrics['total_rewards_std']:.3f}, "
                     f"Val grouped_rewards_mean {val_metrics['grouped_rewards_mean']:.3f}, "
                     f"Val grouped_rewards_std {val_metrics['grouped_rewards_std']:.3f}, "
-                    f"Val kl {val_metrics['kl']:.3f}"
+                    f"Val kl {val_metrics['kl']:.3f}, "
+                    f"Val clip_fraction {val_metrics.get('clip_fraction', 0.0):.3f}, "
+                    f"Val length {val_metrics.get('completion_mean_length', 0.0):.1f}"
                 )
 
                 for i, reward_func in enumerate(reward_funcs):
@@ -945,7 +952,9 @@ def train_grpo(
                     f"Total rewards std {avg_metrics['total_rewards_std']:.3f}, "
                     f"Grouped rewards mean {avg_metrics['grouped_rewards_mean']:.3f}, "
                     f"Grouped rewards std {avg_metrics['grouped_rewards_std']:.3f}, "
-                    f"KL {avg_metrics['kl']:.3f}"
+                    f"KL {avg_metrics['kl']:.3f}, "
+                    f"Clip fraction {avg_metrics.get('clip_fraction', 0.0):.3f}, "
+                    f"Avg length {avg_metrics.get('completion_mean_length', 0.0):.1f}"
                 )
 
                 for i, reward_func in enumerate(reward_funcs):
