@@ -404,11 +404,27 @@ def grpo_loss(
 
     per_token_loss = per_token_loss * length_mask
 
-    # Average over tokens
-    loss = (per_token_loss * length_mask).sum() / length_mask.sum() # Matches the pytorch implementaiton
+    # Get total valid tokens for safer division
+    total_valid_tokens = length_mask.sum()
+    
+    # Average over tokens with NaN protection
+    if total_valid_tokens > 0:
+        loss = (per_token_loss * length_mask).sum() / total_valid_tokens  # Matches the pytorch implementation
+    else:
+        loss = mx.array(0.0, dtype=mx.float32)  # Fallback to zero loss if no valid tokens
 
-    # Calculate mean KL divergence for metrics
-    mean_kl = ((kl_div * length_mask).sum(axis=1) / length_mask.sum(axis=1)).mean()
+    # Calculate mean KL divergence for metrics with NaN protection
+    if total_valid_tokens > 0:
+        # Per-sample valid token counts
+        valid_tokens_per_sample = length_mask.sum(axis=1)
+        # Only include samples with valid tokens
+        valid_samples = valid_tokens_per_sample > 0
+        if valid_samples.sum() > 0:
+            mean_kl = ((kl_div * length_mask).sum(axis=1)[valid_samples] / valid_tokens_per_sample[valid_samples]).mean()
+        else:
+            mean_kl = mx.array(0.0, dtype=mx.float32)
+    else:
+        mean_kl = mx.array(0.0, dtype=mx.float32)
 
     # Collect reward metrics
     reward_metrics = {}
