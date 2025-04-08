@@ -332,13 +332,23 @@ def grpo_loss(
     all_func_rewards = []
 
     for reward_func in reward_funcs:
-        func_rewards = mx.array(
-            reward_func(
-                prompts=expanded_prompts,
-                completions=all_completion_texts,
-                answer=expanded_answers,
-            )
+        # Get raw rewards from function
+        raw_rewards = reward_func(
+            prompts=expanded_prompts,
+            completions=all_completion_texts,
+            answer=expanded_answers,
         )
+        
+        # Handle None values by converting to NaN
+        processed_rewards = []
+        for r in raw_rewards:
+            if r is None:
+                processed_rewards.append(float('nan'))
+            else:
+                processed_rewards.append(float(r))
+        
+        # Convert to MLX array
+        func_rewards = mx.array(processed_rewards, dtype=mx.float32)
         all_func_rewards.append(func_rewards)
 
     rewards_matrix = mx.stack(all_func_rewards, axis=1)
@@ -354,7 +364,14 @@ def grpo_loss(
         reward_weights = mx.ones(len(reward_funcs), dtype=mx.float32)
 
     # Apply reward weights to the reward matrix
-    rewards = (rewards_matrix * mx.expand_dims(reward_weights, 0)).sum(axis=1)
+    weighted_rewards = rewards_matrix * mx.expand_dims(reward_weights, 0)
+    
+    # Replace NaN values with zeros for the sum calculation
+    # This is equivalent to ignoring NaN values in the sum
+    weighted_rewards = mx.where(mx.isnan(weighted_rewards), mx.zeros_like(weighted_rewards), weighted_rewards)
+    
+    # Sum across reward functions
+    rewards = weighted_rewards.sum(axis=1)
 
     num_unique_prompts = len(unique_prompt_indices)
 
