@@ -613,8 +613,14 @@ def evaluate_grpo(
     ntokens = mx.distributed.all_sum(ntokens, stream=mx.cpu)
     all_metrics = {k: mx.distributed.all_sum(v) for k, v in all_metrics.items()}
 
-    avg_metrics = {k: (v / ntokens).item() for k, v in all_metrics.items()}
-    avg_loss = (all_losses / ntokens).item()
+    # NaN protection for metrics and loss calculation
+    if ntokens > 0:
+        avg_metrics = {k: (v / ntokens).item() for k, v in all_metrics.items()}
+        avg_loss = (all_losses / ntokens).item()
+    else:
+        # Fallback to zeros if no tokens were processed
+        avg_metrics = {k: 0.0 for k, v in all_metrics.items()}
+        avg_loss = 0.0
 
     return avg_loss, ntokens, avg_metrics
 
