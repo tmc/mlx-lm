@@ -24,6 +24,51 @@ from .grpo_reward_functions import (
 from .trainer import TrainingArgs, TrainingCallback, average_gradients, grad_checkpoint
 
 
+def nanmean(a, axis=None, keepdims=False):
+    """Calculate mean ignoring NaN values.
+    
+    Args:
+        a: Input array
+        axis: Axis along which to calculate mean
+        keepdims: Whether to keep dimensions
+        
+    Returns:
+        Mean of non-NaN values, or NaN if all values are NaN
+    """
+    mask = mx.logical_not(mx.isnan(a))
+    count = mx.sum(mask, axis=axis, keepdims=keepdims)
+    masked_a = mx.where(mask, a, mx.zeros_like(a))
+    total = mx.sum(masked_a, axis=axis, keepdims=keepdims)
+    return mx.where(count > 0, total / count, mx.full_like(total, float('nan')))
+
+
+def nanstd(a, axis=None, keepdims=False):
+    """Calculate standard deviation ignoring NaN values.
+    
+    Args:
+        a: Input array
+        axis: Axis along which to calculate std
+        keepdims: Whether to keep dimensions
+        
+    Returns:
+        Standard deviation of non-NaN values, or NaN if all values are NaN
+    """
+    mask = mx.logical_not(mx.isnan(a))
+    count = mx.sum(mask, axis=axis, keepdims=True)
+    mean = nanmean(a, axis=axis, keepdims=True)
+    
+    # Calculate squared differences from mean for non-NaN values
+    diff_squared = mx.where(mask, (a - mean) ** 2, mx.zeros_like(a))
+    variance = mx.sum(diff_squared, axis=axis, keepdims=keepdims) / mx.maximum(count - 1, 1)
+    
+    # Return 0 if count <= 1 (std not defined), NaN if all values are NaN
+    result = mx.sqrt(variance)
+    if axis is not None or keepdims:
+        return mx.where(count > 1, result, mx.full_like(result, float('nan')))
+    else:
+        return result if count.item() > 1 else mx.array(float('nan'))
+
+
 @dataclass
 class GRPOTrainingArgs(TrainingArgs):
     group_size: int = field(
@@ -53,6 +98,12 @@ class GRPOTrainingArgs(TrainingArgs):
         default=None,
         metadata={
             "help": "Weights for each reward function. Must match the number of reward functions. If `None`, all rewards are weighted equally with weight `1.0`."
+        },
+    )
+    scale_rewards: bool = field(
+        default=True,
+        metadata={
+            "help": "Whether to scale advantages by their overall standard deviation."
         },
     )
 
@@ -224,6 +275,7 @@ def grpo_loss(
     temperature: float = 0.8,
     reward_weights: Optional[List[float]] = None,
     batch_size: int = 1,
+    scale_rewards: bool = True,
     is_validation: bool = False
 ):
     # Default reward functions if none provided
@@ -366,9 +418,9 @@ def grpo_loss(
     # Apply reward weights to the reward matrix
     weighted_rewards = rewards_matrix * mx.expand_dims(reward_weights, 0)
     
-    # Replace NaN values with zeros for the sum calculation
-    # This is equivalent to ignoring NaN values in the sum
-    weighted_rewards = mx.where(mx.isnan(weighted_rewards), mx.zeros_like(weighted_rewards), weighted_rewards)
+    # Handle NaN values in rewards: replace with zeros for summing
+    nan_mask = mx.isnan(weighted_rewards)
+    weighted_rewards = mx.where(nan_mask, mx.zeros_like(weighted_rewards), weighted_rewards)
     
     # Sum across reward functions
     rewards = weighted_rewards.sum(axis=1)
@@ -411,6 +463,14 @@ def grpo_loss(
             # For prompts with only one completion, advantage is 0
             idx = batch_indices.index(unique_prompt_indices[i])
             advantages[idx] = 0.0
+            
+    # Scale advantages by their overall standard deviation if requested
+    # This helps stabilize training by normalizing the magnitude of advantages
+    if scale_rewards and advantages.size > 1:
+        overall_std_adv = mx.std(advantages)
+        # Only scale if there's meaningful variation
+        if overall_std_adv > epsilon:
+            advantages = advantages / (overall_std_adv + epsilon)
 
     # Compute KL divergence using Schulman's approximator
     kl_div = (
@@ -490,11 +550,16 @@ def grpo_loss(
         ]
     )
 
+    # Calculate completion length statistics
+    completion_lengths = lengths.sum(axis=1)
+    
     metrics = {
         "total_rewards_mean": mx.mean(rewards),
         "total_rewards_std": mx.std(rewards),
         "grouped_rewards_mean": mx.mean(grouped_rewards_mean),
         "grouped_rewards_std": mx.mean(grouped_rewards_std),
+        "completion_mean_length": mx.mean(completion_lengths).item(),
+        "completion_max_length": mx.max(completion_lengths).item() if completion_lengths.size > 0 else 0,
         "kl": mean_kl,
         **reward_metrics,
     }
@@ -616,6 +681,7 @@ def evaluate_grpo(
         r1_count_xml,
     ],
     reward_weights: Optional[List[float]] = None,
+    scale_rewards: bool = True,
     loss_fn: callable = grpo_loss,
     iterate_batches: callable = iterate_grpo_batches,
 ):
@@ -646,6 +712,7 @@ def evaluate_grpo(
             ref_model=ref_model,
             temperature=temperature,
             max_tokens=max_tokens,
+            scale_rewards=scale_rewards,
             is_validation=True
         )
 
@@ -705,8 +772,11 @@ def train_grpo(
     if world_size > 1:
         print(f"Node {rank} of {world_size}")
 
-    if args.grad_checkpoint and hasattr(model, "layers") and len(model.layers) > 0:
-        grad_checkpoint(model.layers[0])
+    if args.grad_checkpoint:
+        if hasattr(model, "layers") and len(model.layers) > 0:
+            grad_checkpoint(model.layers[0])
+        else:
+            print("[Warning] Gradient checkpointing enabled but model.layers not found or empty. Skipping.")
 
     state = [model.state, optimizer.state, mx.random.state]
 
@@ -739,6 +809,7 @@ def train_grpo(
             group_size=args.group_size,
             epsilon=args.epsilon,
             ref_model=ref_model,
+            scale_rewards=args.scale_rewards,
         )
 
         grad = average_gradients(grad)
@@ -797,6 +868,7 @@ def train_grpo(
                 beta=args.beta,
                 epsilon=args.epsilon,
                 temperature=args.temperature,
+                scale_rewards=args.scale_rewards,
                 iterate_batches=iterate_batches,
             )
             
