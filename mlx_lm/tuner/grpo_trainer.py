@@ -595,21 +595,36 @@ def grpo_loss(
     # Calculate completion length statistics
     completion_lengths = lengths.sum(axis=1)
     
-    # Create structured metrics with standardized naming
+    # Check for EOS tokens to track terminated vs clipped sequences
+    # We assume completion_ids has already been created and processed with any EOS tokens
+    # Use a more generic approach based on the completion_mask which has 0s after the EOS token
+    eos_mask = (completion_mask.sum(axis=1) < completion_ids.shape[1])
+    terminated_lengths = completion_lengths[eos_mask] if eos_mask.any() else mx.array([0])
+    clipped_ratio = 1.0 - eos_mask.sum() / len(completion_lengths) if len(completion_lengths) > 0 else 0.0
+    
+    # Create structured metrics with standardized naming to match TRL
     metrics = {
         # Main reward metrics
-        "reward/mean": mx.mean(rewards),
-        "reward/std": mx.std(rewards),
+        "reward": mx.mean(rewards),
+        "reward_std": mx.std(rewards),
         "reward/grouped_mean": mx.mean(grouped_rewards_mean),
         "reward/grouped_std": mx.mean(grouped_rewards_std),
         
         # Completion statistics
         "completions/mean_length": mx.mean(completion_lengths).item(),
         "completions/max_length": mx.max(completion_lengths).item() if completion_lengths.size > 0 else 0,
+        "completions/min_length": mx.min(completion_lengths).item() if completion_lengths.size > 0 else 0,
+        "completions/clipped_ratio": float(clipped_ratio),
+        
+        # Terminated sequence statistics (sequences ending with EOS)
+        "completions/mean_terminated_length": mx.mean(terminated_lengths).item(),
+        "completions/max_terminated_length": mx.max(terminated_lengths).item() if terminated_lengths.size > 0 else 0,
+        "completions/min_terminated_length": mx.min(terminated_lengths).item() if terminated_lengths.size > 0 else 0,
         
         # Policy metrics
-        "policy/clip_fraction": clip_fraction.item(),
-        "kl/mean": mean_kl,
+        "clip_ratio": clip_fraction.item(),
+        "kl": mean_kl,
+        "num_tokens": lengths.sum().item(),
     }
     
     # Add per-function reward metrics with standardized naming
