@@ -226,6 +226,16 @@ def grpo_loss(
     batch_size: int = 1,
     is_validation: bool = False
 ):
+    # Default reward functions if none provided
+    if reward_funcs is None:
+        reward_funcs = [
+            r1_accuracy_reward_func,
+            r1_int_reward_func,
+            r1_strict_format_reward_func,
+            r1_soft_format_reward_func,
+            r1_count_xml,
+        ]
+    
     prompt_tokens, _, prompt_text, answer_text = batch
     
     if completions is not None and completion_texts is not None and batch_indices is not None:
