@@ -306,13 +306,13 @@ def grpo_loss(
     attention_mask = mx.stack(attention_masks)
     lengths = attention_mask.sum(axis=1)
 
-    token_log_probs = get_per_token_logps(model, inputs, lengths)
+    token_log_probs = get_per_token_logps(model, inputs, lengths, temperature=temperature)
     mx.eval(token_log_probs)
 
     if ref_model is None:
         ref_token_log_probs = token_log_probs
     else:
-        ref_token_log_probs = get_per_token_logps(ref_model, inputs, lengths)
+        ref_token_log_probs = get_per_token_logps(ref_model, inputs, lengths, temperature=temperature)
         mx.eval(ref_token_log_probs)
 
     max_len = max(x.shape[0] for x in token_log_probs)
