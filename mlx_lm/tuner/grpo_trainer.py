@@ -106,6 +106,30 @@ class GRPOTrainingArgs(TrainingArgs):
             "help": "Whether to scale advantages by their overall standard deviation."
         },
     )
+    wandb_log_samples: bool = field(
+        default=True,
+        metadata={
+            "help": "Log sample tables to WandB during validation."
+        },
+    )
+    wandb_num_samples: int = field(
+        default=8,
+        metadata={
+            "help": "Number of samples to log per validation."
+        },
+    )
+    wandb_sample_strategy: str = field(
+        default="best_worst_median",
+        metadata={
+            "help": "Strategy for selecting samples to log. Options: best_worst_median, percentiles, random"
+        },
+    )
+    wandb_sample_percentiles: Optional[List[int]] = field(
+        default=None,
+        metadata={
+            "help": "Percentiles to log if strategy is 'percentiles'. Default: [10, 50, 90]"
+        },
+    )
 
 
 def get_per_token_logps(model: nn.Module, inputs, lengths, temperature=1.0):
@@ -532,17 +556,31 @@ def grpo_loss(
 
     # Collect reward metrics
     reward_metrics = {}
+    individual_rewards = {}
+    
     for i, reward_func in enumerate(reward_funcs):
         func_name = reward_func.__name__
-        func_rewards = mx.array(
-            reward_func(
-                prompts=expanded_prompts,
-                completions=all_completion_texts,
-                answer=expanded_answers,
-            )
+        # Get raw rewards
+        raw_rewards = reward_func(
+            prompts=expanded_prompts,
+            completions=all_completion_texts,
+            answer=expanded_answers,
         )
+        
+        # Handle None values in raw rewards
+        processed_rewards = []
+        for r in raw_rewards:
+            if r is None:
+                processed_rewards.append(float('nan'))
+            else:
+                processed_rewards.append(float(r))
+        
+        func_rewards = mx.array(processed_rewards)
         reward_metrics[f"{func_name}_mean"] = mx.mean(func_rewards)
         reward_metrics[f"{func_name}_std"] = mx.std(func_rewards)
+        
+        # Store individual reward values for potential sample collection
+        individual_rewards[func_name] = func_rewards
 
     grouped_rewards_mean = mx.array(
         [mx.mean(mx.array(rewards)) for rewards in rewards_by_prompt]
@@ -557,17 +595,31 @@ def grpo_loss(
     # Calculate completion length statistics
     completion_lengths = lengths.sum(axis=1)
     
+    # Create structured metrics with standardized naming
     metrics = {
-        "total_rewards_mean": mx.mean(rewards),
-        "total_rewards_std": mx.std(rewards),
-        "grouped_rewards_mean": mx.mean(grouped_rewards_mean),
-        "grouped_rewards_std": mx.mean(grouped_rewards_std),
-        "completion_mean_length": mx.mean(completion_lengths).item(),
-        "completion_max_length": mx.max(completion_lengths).item() if completion_lengths.size > 0 else 0,
-        "clip_fraction": clip_fraction.item(),
-        "kl": mean_kl,
-        **reward_metrics,
+        # Main reward metrics
+        "reward/mean": mx.mean(rewards),
+        "reward/std": mx.std(rewards),
+        "reward/grouped_mean": mx.mean(grouped_rewards_mean),
+        "reward/grouped_std": mx.mean(grouped_rewards_std),
+        
+        # Completion statistics
+        "completions/mean_length": mx.mean(completion_lengths).item(),
+        "completions/max_length": mx.max(completion_lengths).item() if completion_lengths.size > 0 else 0,
+        
+        # Policy metrics
+        "policy/clip_fraction": clip_fraction.item(),
+        "kl/mean": mean_kl,
     }
+    
+    # Add per-function reward metrics with standardized naming
+    for func_name, value in reward_metrics.items():
+        if func_name.endswith("_mean"):
+            base_name = func_name[:-5]  # Remove "_mean" suffix
+            metrics[f"rewards/{base_name}/mean"] = value
+        elif func_name.endswith("_std"):
+            base_name = func_name[:-4]  # Remove "_std" suffix
+            metrics[f"rewards/{base_name}/std"] = value
 
     if is_validation and all_completion_texts:
         try:
@@ -605,9 +657,19 @@ def grpo_loss(
             print(f"\nError printing validation details: {e}")
             print("Continuing with training...\n")
 
+    # Collect sample data for potential reporting
+    sample_data = {
+        "prompts": expanded_prompts,
+        "completions": all_completion_texts,
+        "answers": expanded_answers,
+        "rewards": rewards,
+        "advantages": advantages,
+        "individual_rewards": individual_rewards,
+    }
+    
     mx.metal.clear_cache()
 
-    return loss, length_mask.sum(axis=1).sum(), metrics
+    return loss, length_mask.sum(axis=1).sum(), metrics, sample_data
 
 
 def iterate_grpo_batches(dataset, batch_size, max_seq_length, train=False):
@@ -687,6 +749,10 @@ def evaluate_grpo(
     ],
     reward_weights: Optional[List[float]] = None,
     scale_rewards: bool = True,
+    wandb_log_samples: bool = True,
+    wandb_num_samples: int = 8,
+    wandb_sample_strategy: str = "best_worst_median",
+    wandb_sample_percentiles: Optional[List[int]] = None,
     loss_fn: callable = grpo_loss,
     iterate_batches: callable = iterate_grpo_batches,
 ):
@@ -694,6 +760,16 @@ def evaluate_grpo(
     all_losses = mx.array(0.0, dtype=mx.float32)
     ntokens = mx.array(0, dtype=mx.int32)
     all_metrics = None
+    
+    # For collecting sample data for reporting
+    all_sample_data = {
+        "prompts": [],
+        "completions": [],
+        "answers": [],
+        "rewards": [],
+        "advantages": [],
+        "individual_rewards": {}
+    }
 
     index_iterator = iter(range(num_batches)) if num_batches != -1 else iter(int, 1)
 
@@ -705,7 +781,7 @@ def evaluate_grpo(
             max_seq_length=max_seq_length,
         ),
     ):
-        losses, toks, metrics = loss_fn(
+        losses, toks, metrics, batch_samples = loss_fn(
             model=model,
             tokenizer=tokenizer,
             batch=batch,
@@ -729,6 +805,21 @@ def evaluate_grpo(
         else:
             for k, v in metrics.items():
                 all_metrics[k] += v * toks
+        
+        # Accumulate sample data
+        all_sample_data["prompts"].extend(batch_samples["prompts"])
+        all_sample_data["completions"].extend(batch_samples["completions"])
+        all_sample_data["answers"].extend(batch_samples["answers"])
+        
+        # Convert arrays to lists for easier accumulation
+        all_sample_data["rewards"].extend(batch_samples["rewards"].tolist())
+        all_sample_data["advantages"].extend(batch_samples["advantages"].tolist())
+        
+        # Accumulate individual reward values
+        for func_name, rewards in batch_samples["individual_rewards"].items():
+            if func_name not in all_sample_data["individual_rewards"]:
+                all_sample_data["individual_rewards"][func_name] = []
+            all_sample_data["individual_rewards"][func_name].extend(rewards.tolist())
 
         mx.eval(all_losses, ntokens)
 
@@ -745,8 +836,31 @@ def evaluate_grpo(
         # Fallback to zeros if no tokens were processed
         avg_metrics = {k: 0.0 for k, v in all_metrics.items()}
         avg_loss = 0.0
+    
+    # Add a timestamp for logging purposes
+    avg_metrics["val_time"] = time.perf_counter()
+    
+    # Convert sample data rewards back to mx.arrays for the callback
+    if all_sample_data["rewards"]:
+        world = mx.distributed.init()
+        rank = world.rank()
+        
+        # Only provide sample data on rank 0 to avoid duplication
+        if rank == 0:
+            sample_data = {
+                "prompts": all_sample_data["prompts"],
+                "completions": all_sample_data["completions"],
+                "answers": all_sample_data["answers"],
+                "rewards": mx.array(all_sample_data["rewards"]),
+                "advantages": mx.array(all_sample_data["advantages"]),
+                "individual_rewards": {k: mx.array(v) for k, v in all_sample_data["individual_rewards"].items()}
+            }
+        else:
+            sample_data = None
+    else:
+        sample_data = None
 
-    return avg_loss, ntokens, avg_metrics
+    return avg_loss, ntokens, avg_metrics, sample_data
 
 
 def train_grpo(
@@ -857,7 +971,7 @@ def train_grpo(
             if hasattr(model, "eval"):
                 model.eval()
                 
-            val_loss, val_ntokens, val_metrics = evaluate_grpo(
+            val_loss, val_ntokens, val_metrics, val_samples = evaluate_grpo(
                 model=model,
                 dataset=val_dataset,
                 loss_fn=loss_fn,
@@ -905,14 +1019,17 @@ def train_grpo(
                 )
 
             if training_callback is not None:
-                training_callback.on_val_loss_report(
-                    {
-                        "iteration": it,
-                        "val_loss": val_loss,
-                        **{f"val_{k}": v for k, v in val_metrics.items()},
-                        "val_time": val_time,
-                    }
-                )
+                # Prepare validation info with hierarchical metrics and sample data
+                val_info = {
+                    "iteration": it,
+                    "val_loss": val_loss,
+                    # Preserve the hierarchical structure for metrics
+                    "val_metrics": val_metrics,
+                    # Include samples data for callbacks to use (e.g., WandB)
+                    "validation_samples": val_samples
+                }
+                
+                training_callback.on_val_loss_report(val_info)
             
             # Clear cache after validation to prevent memory buildup
             mx.metal.clear_cache()
@@ -974,18 +1091,23 @@ def train_grpo(
                 )
 
             if training_callback is not None:
-                training_callback.on_train_loss_report(
-                    {
-                        "iteration": it,
-                        "train_loss": train_loss,
-                        **{f"train_{k}": v for k, v in avg_metrics.items()},
+                # Prepare training info with system metrics and hierarchical metrics
+                train_info = {
+                    "iteration": it,
+                    "train_loss": train_loss,
+                    # Preserve the hierarchical structure for metrics
+                    "train_metrics": avg_metrics,
+                    # System metrics
+                    "system": {
                         "learning_rate": learning_rate,
                         "iterations_per_second": it_sec,
                         "tokens_per_second": tokens_sec,
                         "trained_tokens": trained_tokens,
-                        "peak_memory": peak_mem,
+                        "peak_memory_gb": peak_mem,
                     }
-                )
+                }
+                
+                training_callback.on_train_loss_report(train_info)
 
             losses = 0
             n_tokens = 0
