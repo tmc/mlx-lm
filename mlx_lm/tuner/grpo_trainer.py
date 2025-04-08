@@ -545,11 +545,14 @@ def iterate_grpo_batches(dataset, batch_size, max_seq_length, train=False):
             prompts_text = [item[2] for item in current_batch]
             answers_text = [item[3] for item in current_batch]
 
+            # Check and truncate prompts that exceed max_seq_length
             if any(len(p) > max_seq_length for p in prompts_tokens):
                 print(
                     f"[WARNING] Some prompts are longer than {max_seq_length} tokens. "
                     "Long prompts will be truncated."
                 )
+                # Actually truncate the prompts
+                prompts_tokens = [p[:max_seq_length] for p in prompts_tokens]
 
             yield prompts_tokens, answers_tokens, prompts_text, answers_text
 
