@@ -567,6 +567,7 @@ def evaluate_grpo(
         r1_soft_format_reward_func,
         r1_count_xml,
     ],
+    reward_weights: Optional[List[float]] = None,
     loss_fn: callable = grpo_loss,
     iterate_batches: callable = iterate_grpo_batches,
 ):
@@ -589,6 +590,7 @@ def evaluate_grpo(
             tokenizer=tokenizer,
             batch=batch,
             reward_funcs=reward_funcs,
+            reward_weights=reward_weights,
             beta=beta,
             group_size=group_size,
             epsilon=epsilon,
@@ -726,6 +728,7 @@ def train_grpo(
                 loss_fn=loss_fn,
                 ref_model=ref_model,
                 reward_funcs=reward_funcs,
+                reward_weights=args.reward_weights,
                 tokenizer=tokenizer,
                 group_size=args.group_size,
                 batch_size=args.batch_size,
