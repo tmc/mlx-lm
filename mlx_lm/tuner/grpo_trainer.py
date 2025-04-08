@@ -381,21 +381,34 @@ def grpo_loss(
         rewards_by_prompt[prompt_position].append(rewards[i])
 
     advantages = mx.zeros_like(rewards)
-    for i, prompt_rewards in enumerate(rewards_by_prompt):
-        if len(prompt_rewards) > 1:
-            prompt_rewards = mx.array(prompt_rewards)
-            mean_reward = mx.mean(prompt_rewards)
-            std_reward = mx.std(prompt_rewards)
+    for i, prompt_rewards_list in enumerate(rewards_by_prompt):
+        # Only calculate advantages if we have more than one sample per prompt
+        # (required for meaningful mean/std calculations)
+        if len(prompt_rewards_list) > 1:
+            prompt_rewards_tensor = mx.array(prompt_rewards_list)
+            mean_reward = mx.mean(prompt_rewards_tensor)
+            std_reward = mx.std(prompt_rewards_tensor)
+            
+            # Find indices of all completions for this prompt
             indices = [
                 j
                 for j, idx in enumerate(batch_indices)
                 if idx == unique_prompt_indices[i]
             ]
-            for j, idx in enumerate(indices):
-                advantages[idx] = (prompt_rewards[j] - mean_reward) / (
-                    std_reward + epsilon
-                )
+            
+            # Only standardize if there's actual variance in rewards
+            if std_reward > 0:
+                for j, idx in enumerate(indices):
+                    advantages[idx] = (prompt_rewards_tensor[j] - mean_reward) / (
+                        std_reward + epsilon
+                    )
+            else:
+                # If all rewards are identical, use raw differences from mean
+                # (which will be zero, but this is more explicit and future-proof)
+                for j, idx in enumerate(indices):
+                    advantages[idx] = prompt_rewards_tensor[j] - mean_reward
         else:
+            # For prompts with only one completion, advantage is 0
             idx = batch_indices.index(unique_prompt_indices[i])
             advantages[idx] = 0.0
 
