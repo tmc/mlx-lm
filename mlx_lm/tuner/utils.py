@@ -2,7 +2,7 @@
 import json
 import types
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional
 
 import mlx.core as mx
 import mlx.nn as nn

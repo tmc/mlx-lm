@@ -25,7 +25,7 @@ from .trainer import TrainingArgs, TrainingCallback, average_gradients, grad_che
 
 
 def nanmean(a, axis=None, keepdims=False):
-    """Calculate mean ignoring NaN values.
+    """Calculate mean ignoring NaN values (similar to torch.nanmean).
     
     Args:
         a: Input array
@@ -39,11 +39,13 @@ def nanmean(a, axis=None, keepdims=False):
     count = mx.sum(mask, axis=axis, keepdims=keepdims)
     masked_a = mx.where(mask, a, mx.zeros_like(a))
     total = mx.sum(masked_a, axis=axis, keepdims=keepdims)
-    return mx.where(count > 0, total / count, mx.full_like(total, float('nan')))
+    # Create an array of NaNs with the same shape as total
+    nan_array = mx.ones_like(total) * float('nan')
+    return mx.where(count > 0, total / count, nan_array)
 
 
 def nanstd(a, axis=None, keepdims=False):
-    """Calculate standard deviation ignoring NaN values.
+    """Calculate standard deviation ignoring NaN values (similar to PyTorch implementation).
     
     Args:
         a: Input array
@@ -59,12 +61,19 @@ def nanstd(a, axis=None, keepdims=False):
     
     # Calculate squared differences from mean for non-NaN values
     diff_squared = mx.where(mask, (a - mean) ** 2, mx.zeros_like(a))
-    variance = mx.sum(diff_squared, axis=axis, keepdims=keepdims) / mx.maximum(count - 1, 1)
+    
+    # Use Bessel's correction (n-1) for unbiased estimation when count > 1
+    # This matches PyTorch's behavior
+    variance = mx.sum(diff_squared, axis=axis, keepdims=keepdims)
+    denom = mx.maximum(count - 1, 1)  # Avoid division by 0
+    variance = variance / denom
     
     # Return 0 if count <= 1 (std not defined), NaN if all values are NaN
     result = mx.sqrt(variance)
     if axis is not None or keepdims:
-        return mx.where(count > 1, result, mx.full_like(result, float('nan')))
+        # Create an array of NaNs with the same shape as result
+        nan_array = mx.ones_like(result) * float('nan')
+        return mx.where(count > 1, result, nan_array)
     else:
         return result if count.item() > 1 else mx.array(float('nan'))
 
@@ -196,9 +205,9 @@ def generate_step(
             mx.eval(next_y, next_logprobs)
             y, logprobs = next_y, next_logprobs
             if (n + 1) % 32 == 0:
-                mx.metal.clear_cache()
+                mx.clear_cache()
     finally:
-        mx.metal.clear_cache()
+        mx.clear_cache()
 
 
 def generate_grpo(
@@ -275,10 +284,10 @@ def generate_grpo(
                         all_completions.append(mx.stop_gradient(completion_ids))
                         all_completion_texts.append(completion_text)
             
-            mx.metal.clear_cache()
+            mx.clear_cache()
     
     finally:
-        mx.metal.clear_cache()
+        mx.clear_cache()
     
     return all_completions, all_completion_texts, batch_indices
 
@@ -545,14 +554,39 @@ def grpo_loss(
     if total_valid_tokens > 0:
         # Per-sample valid token counts
         valid_tokens_per_sample = length_mask.sum(axis=1)
-        # Only include samples with valid tokens
-        valid_samples = valid_tokens_per_sample > 0
-        if valid_samples.sum() > 0:
-            mean_kl = ((kl_div * length_mask).sum(axis=1)[valid_samples] / valid_tokens_per_sample[valid_samples]).mean()
+        
+        # Calculate sum of KL for each sample
+        kl_sum_per_sample = (kl_div * length_mask).sum(axis=1)
+        
+        # Calculate mean KL per sample but avoid division by zero
+        # by setting the result to 0 where token count is 0
+        per_sample_kl = mx.where(
+            valid_tokens_per_sample > 0,
+            kl_sum_per_sample / valid_tokens_per_sample,
+            mx.zeros_like(kl_sum_per_sample)
+        )
+        
+        # Calculate the overall mean, making sure to only consider samples with valid tokens
+        valid_sample_count = mx.sum(valid_tokens_per_sample > 0)
+        if valid_sample_count > 0:
+            # Sum all per-sample KLs and divide by number of valid samples
+            mean_kl = mx.sum(per_sample_kl * (valid_tokens_per_sample > 0)) / valid_sample_count
         else:
             mean_kl = mx.array(0.0, dtype=mx.float32)
     else:
         mean_kl = mx.array(0.0, dtype=mx.float32)
+        
+    # --- Calculate Policy Stats ---
+    # Calculate clip_ratio: fraction of tokens where PPO objective was clipped
+    # Method 2: Explicitly check the conditions for clipping based on advantage sign
+    adv_reshaped = advantages.reshape(-1, 1)
+    ratio_lower_bound = 1.0 - epsilon
+    ratio_upper_bound = 1.0 + epsilon
+    is_clipped = mx.logical_or(
+        mx.logical_and(policy_ratio < ratio_lower_bound, adv_reshaped < 0),
+        mx.logical_and(policy_ratio > ratio_upper_bound, adv_reshaped > 0)
+    )
+    clip_ratio = (is_clipped * length_mask).sum() / total_valid_tokens if total_valid_tokens > 0 else mx.array(0.0)
 
     # Collect reward metrics
     reward_metrics = {}
@@ -576,8 +610,9 @@ def grpo_loss(
                 processed_rewards.append(float(r))
         
         func_rewards = mx.array(processed_rewards)
-        reward_metrics[f"{func_name}_mean"] = mx.mean(func_rewards)
-        reward_metrics[f"{func_name}_std"] = mx.std(func_rewards)
+        # Use nanmean/nanstd to correctly handle NaN values (matching TRL behavior)
+        reward_metrics[f"{func_name}_mean"] = nanmean(func_rewards)
+        reward_metrics[f"{func_name}_std"] = nanstd(func_rewards)
         
         # Store individual reward values for potential sample collection
         individual_rewards[func_name] = func_rewards
@@ -592,49 +627,85 @@ def grpo_loss(
         ]
     )
 
-    # Calculate completion length statistics
-    completion_lengths = lengths.sum(axis=1)
+    # Calculate completion statistics to track terminated vs truncated sequences
+    # Get true completion lengths (not padded) from actual completions
+    completion_lengths = mx.array([len(comp) for comp in all_completions])
     
-    # Check for EOS tokens to track terminated vs clipped sequences
-    # We assume completion_ids has already been created and processed with any EOS tokens
-    # Use a more generic approach based on the completion_mask which has 0s after the EOS token
-    eos_mask = (completion_mask.sum(axis=1) < completion_ids.shape[1])
-    terminated_lengths = completion_lengths[eos_mask] if eos_mask.any() else mx.array([0])
-    clipped_ratio = 1.0 - eos_mask.sum() / len(completion_lengths) if len(completion_lengths) > 0 else 0.0
+    # Identify terminated sequences (those ending with EOS or special end token)
+    # We check by seeing if a completion is shorter than max_tokens
+    terminated_mask = completion_lengths < max_tokens
+    terminated_ratio = terminated_mask.sum() / len(completion_lengths) if len(completion_lengths) > 0 else 0.0
+    clipped_ratio = 1.0 - terminated_ratio
     
-    # Create structured metrics with standardized naming to match TRL
+    # Get statistics for terminated sequences without using boolean indexing
+    # Convert boolean mask to indices first, as MLX doesn't support boolean indexing
+    if mx.sum(terminated_mask) > 0:
+        # Get indices where terminated_mask is True
+        terminated_indices = mx.array([i for i, is_term in enumerate(terminated_mask.tolist()) if is_term])
+        # Use take to get the corresponding lengths
+        terminated_lengths = mx.take(completion_lengths, terminated_indices)
+    else:
+        terminated_lengths = mx.array([0])
+    
+    # Get mean, min, max of completion lengths
+    comp_mean_len = mx.mean(completion_lengths).item() if completion_lengths.size > 0 else 0.0
+    comp_max_len = mx.max(completion_lengths).item() if completion_lengths.size > 0 else 0.0
+    comp_min_len = mx.min(completion_lengths).item() if completion_lengths.size > 0 else 0.0
+    
+    # Get mean, min, max of terminated completion lengths
+    term_mean_len = mx.mean(terminated_lengths).item() if terminated_lengths.size > 0 else 0.0
+    term_max_len = mx.max(terminated_lengths).item() if terminated_lengths.size > 0 else 0.0
+    term_min_len = mx.min(terminated_lengths).item() if terminated_lengths.size > 0 else 0.0
+    
+    # Store individual reward metrics for easier access
+    all_individual_rewards = {}
+    for i, reward_func in enumerate(reward_funcs):
+        func_name = reward_func.__name__
+        all_individual_rewards[func_name] = rewards_matrix[:, i]
+    
+    # Create TRL-aligned metrics dictionary with hierarchical structure
+    # Structure follows exactly what's described in the user experience document
     metrics = {
-        # Main reward metrics
-        "reward": mx.mean(rewards),
-        "reward_std": mx.std(rewards),
-        "reward/grouped_mean": mx.mean(grouped_rewards_mean),
-        "reward/grouped_std": mx.mean(grouped_rewards_std),
+        # Loss and overall performance
+        "loss": loss,
+        
+        # Primary reward metrics
+        "reward/mean": nanmean(rewards),  # Primary indicator for model optimization
+        "reward/std": nanstd(rewards),
+        "reward/grouped_mean": nanmean(grouped_rewards_mean),
+        "reward/grouped_std": nanmean(grouped_rewards_std),
+        
+        # Policy metrics 
+        "policy/kl_mean": mean_kl,  # KL from reference policy
+        "policy/clip_ratio": clip_ratio,  # How often updates are clipped
         
         # Completion statistics
-        "completions/mean_length": mx.mean(completion_lengths).item(),
-        "completions/max_length": mx.max(completion_lengths).item() if completion_lengths.size > 0 else 0,
-        "completions/min_length": mx.min(completion_lengths).item() if completion_lengths.size > 0 else 0,
+        "completions/mean_length": comp_mean_len,
+        "completions/max_length": comp_max_len,
+        "completions/min_length": comp_min_len,
         "completions/clipped_ratio": float(clipped_ratio),
+        "completions/terminated_ratio": float(terminated_ratio),
         
-        # Terminated sequence statistics (sequences ending with EOS)
-        "completions/mean_terminated_length": mx.mean(terminated_lengths).item(),
-        "completions/max_terminated_length": mx.max(terminated_lengths).item() if terminated_lengths.size > 0 else 0,
-        "completions/min_terminated_length": mx.min(terminated_lengths).item() if terminated_lengths.size > 0 else 0,
+        # Terminated sequence statistics
+        "completions/mean_terminated_length": term_mean_len,
+        "completions/max_terminated_length": term_max_len,
+        "completions/min_terminated_length": term_min_len,
         
-        # Policy metrics
-        "clip_ratio": clip_fraction.item(),
-        "kl": mean_kl,
-        "num_tokens": lengths.sum().item(),
+        # System statistics
+        "system/num_tokens": lengths.sum().item(),
     }
     
-    # Add per-function reward metrics with standardized naming
-    for func_name, value in reward_metrics.items():
-        if func_name.endswith("_mean"):
-            base_name = func_name[:-5]  # Remove "_mean" suffix
-            metrics[f"rewards/{base_name}/mean"] = value
-        elif func_name.endswith("_std"):
-            base_name = func_name[:-4]  # Remove "_std" suffix
-            metrics[f"rewards/{base_name}/std"] = value
+    # Add individual reward function stats with standardized naming
+    # Crucial for monitoring individual reward components
+    for fname in all_individual_rewards:
+        metrics[f"rewards/{fname}/mean"] = nanmean(all_individual_rewards[fname])
+        metrics[f"rewards/{fname}/std"] = nanstd(all_individual_rewards[fname])
+    
+    # Add aliases for backward compatibility
+    metrics["reward"] = metrics["reward/mean"]
+    metrics["reward_std"] = metrics["reward/std"]
+    metrics["kl"] = metrics["policy/kl_mean"]
+    metrics["clip_ratio"] = metrics["policy/clip_ratio"]
 
     if is_validation and all_completion_texts:
         try:
@@ -672,17 +743,39 @@ def grpo_loss(
             print(f"\nError printing validation details: {e}")
             print("Continuing with training...\n")
 
-    # Collect sample data for potential reporting
+    # Collect rich sample data for WandB reporting
     sample_data = {
+        # Basic sample information
         "prompts": expanded_prompts,
         "completions": all_completion_texts,
         "answers": expanded_answers,
+        
+        # Reward and policy metrics
         "rewards": rewards,
         "advantages": advantages,
-        "individual_rewards": individual_rewards,
+        "kl_div_per_token": (kl_div * length_mask).sum(axis=1) / mx.maximum(length_mask.sum(axis=1), 1),
+        "policy_ratio": policy_ratio,
+        
+        # Individual reward components
+        "individual_rewards": all_individual_rewards,
+        
+        # Completion statistics
+        "completion_lengths": completion_lengths,
+        "terminated_mask": terminated_mask,
+        
+        # Stats for histograms
+        "stats": {
+            "mean_reward": nanmean(rewards).item(),
+            "std_reward": nanstd(rewards).item(),
+            "mean_advantage": nanmean(advantages).item(),
+            "std_advantage": nanstd(advantages).item(),
+            "mean_completion_length": comp_mean_len,
+            "clip_ratio": clip_ratio.item(),
+            "kl": mean_kl.item(),
+        }
     }
     
-    mx.metal.clear_cache()
+    mx.clear_cache()
 
     return loss, length_mask.sum(axis=1).sum(), metrics, sample_data
 
@@ -776,14 +869,25 @@ def evaluate_grpo(
     ntokens = mx.array(0, dtype=mx.int32)
     all_metrics = None
     
-    # For collecting sample data for reporting
+    # For collecting rich sample data for reporting and reward function analysis
     all_sample_data = {
+        # Basic sample information
         "prompts": [],
         "completions": [],
         "answers": [],
+        
+        # Reward and policy metrics
         "rewards": [],
         "advantages": [],
-        "individual_rewards": {}
+        "completion_lengths": [],
+        "kl_div_per_sample": [],
+        
+        # Individual reward components dictionary
+        "individual_rewards": {},
+        
+        # Track metadata for each prompt to enable grouping analysis
+        "prompt_indices": [],
+        "batch_indices": []
     }
 
     index_iterator = iter(range(num_batches)) if num_batches != -1 else iter(int, 1)
@@ -821,14 +925,35 @@ def evaluate_grpo(
             for k, v in metrics.items():
                 all_metrics[k] += v * toks
         
-        # Accumulate sample data
+        # Accumulate rich sample data for deep reward analysis
         all_sample_data["prompts"].extend(batch_samples["prompts"])
         all_sample_data["completions"].extend(batch_samples["completions"])
         all_sample_data["answers"].extend(batch_samples["answers"])
         
+        # Store batch indices for grouping analysis
+        current_batch_start = len(all_sample_data["prompts"]) - len(batch_samples["prompts"])
+        all_sample_data["batch_indices"].extend([i // batch_size for i in range(current_batch_start, len(all_sample_data["prompts"]))])
+        
         # Convert arrays to lists for easier accumulation
         all_sample_data["rewards"].extend(batch_samples["rewards"].tolist())
         all_sample_data["advantages"].extend(batch_samples["advantages"].tolist())
+        
+        # Store additional metrics if available
+        if "completion_lengths" in batch_samples:
+            all_sample_data["completion_lengths"].extend(batch_samples["completion_lengths"].tolist())
+        
+        if "kl_div_per_token" in batch_samples:
+            all_sample_data["kl_div_per_sample"].extend(batch_samples["kl_div_per_token"].tolist())
+        
+        # Track prompt indices (for grouping completions by prompt)
+        if "prompt_indices" in batch_samples:
+            all_sample_data["prompt_indices"].extend(batch_samples["prompt_indices"])
+        else:
+            # Default to sequential indices if not provided
+            all_sample_data["prompt_indices"].extend(range(
+                len(all_sample_data["prompt_indices"]),
+                len(all_sample_data["prompt_indices"]) + len(batch_samples["prompts"])
+            ))
         
         # Accumulate individual reward values
         for func_name, rewards in batch_samples["individual_rewards"].items():
@@ -919,8 +1044,10 @@ def train_grpo(
         if hasattr(model, "train"):
             model.train()
         
+        # Unpack batch
         prompt_tokens, targets, prompt_lens, target_lens = batch
         
+        # First generate completions
         all_completions, all_completion_texts, batch_indices = generate_grpo(
             model=model,
             tokenizer=tokenizer,
@@ -930,11 +1057,48 @@ def train_grpo(
             temperature=args.temperature,
             batch_size=args.batch_size
         )
-
-        (loss, toks, metrics), grad = loss_value_and_grad(
-            model,
+        
+        # Define a more robust value and grad function
+        # This directly uses value_and_grad on a custom loss function
+        def custom_loss_for_grad(model_params):
+            # Restore model parameters for this gradient computation
+            state = [model.state]
+            
+            # Call loss_fn directly with all necessary parameters
+            loss_val, token_count, metrics_dict, _ = loss_fn(
+                model=model,
+                ref_model=ref_model,
+                tokenizer=tokenizer,
+                batch=batch,
+                completions=all_completions,
+                completion_texts=all_completion_texts,
+                batch_indices=batch_indices,
+                reward_funcs=reward_funcs,
+                beta=args.beta,
+                group_size=args.group_size,
+                epsilon=args.epsilon,
+                max_tokens=args.max_completion_length,
+                temperature=args.temperature,
+                reward_weights=args.reward_weights,
+                batch_size=args.batch_size,
+                scale_rewards=args.scale_rewards
+            )
+            
+            # Return only the loss value for gradient computation
+            return loss_val
+        
+        # Get the value and gradient directly - mx.grad is in mlx.core, not mlx.nn
+        loss_and_grad = nn.value_and_grad(custom_loss_for_grad)
+        
+        # Compute loss and gradient
+        loss_val, grad = loss_and_grad(model.trainable_parameters())
+        
+        # Call loss_fn again to get metrics (without computing gradients)
+        loss, toks, metrics, _ = loss_fn(
+            model=model,
+            ref_model=ref_model,
             tokenizer=tokenizer,
-            batch=(prompt_tokens, targets, prompt_lens, target_lens),
+            batch=batch,
             completions=all_completions,
             completion_texts=all_completion_texts,
             batch_indices=batch_indices,
@@ -942,8 +1106,11 @@ def train_grpo(
             beta=args.beta,
             group_size=args.group_size,
             epsilon=args.epsilon,
-            ref_model=ref_model,
-            scale_rewards=args.scale_rewards,
+            max_tokens=args.max_completion_length,
+            temperature=args.temperature,
+            reward_weights=args.reward_weights,
+            batch_size=args.batch_size,
+            scale_rewards=args.scale_rewards
         )
 
         grad = average_gradients(grad)
@@ -951,23 +1118,44 @@ def train_grpo(
 
         return loss, toks, metrics
 
-    loss_value_and_grad = nn.value_and_grad(model, loss_fn)
+    # Value and grad is now defined inside the step function
 
     losses = 0
     n_tokens = 0
     steps = 0
     trained_tokens = 0
+    # Initialize accumulated metrics with TRL-standardized names
+    # Matches the exact structure from user experience document
     accumulated_metrics = {
-        "total_rewards_mean": 0,
-        "total_rewards_std": 0,
-        "grouped_rewards_mean": 0,
-        "grouped_rewards_std": 0,
-        "kl": 0,
+        # Primary metrics
+        "reward/mean": 0,
+        "reward/std": 0,
+        "reward/grouped_mean": 0,
+        "reward/grouped_std": 0,
+        
+        # Policy metrics
+        "policy/kl_mean": 0,
+        "policy/clip_ratio": 0,
+        
+        # Completion statistics
+        "completions/mean_length": 0,
+        "completions/max_length": 0,
+        "completions/min_length": 0,
+        "completions/clipped_ratio": 0,
+        "completions/terminated_ratio": 0,
     }
+    
+    # Add individual reward function metrics with standardized naming
     for reward_func in reward_funcs:
         func_name = reward_func.__name__
-        accumulated_metrics[f"{func_name}_mean"] = 0
-        accumulated_metrics[f"{func_name}_std"] = 0
+        accumulated_metrics[f"rewards/{func_name}/mean"] = 0
+        accumulated_metrics[f"rewards/{func_name}/std"] = 0
+    
+    # Add aliases for backward compatibility during training loop
+    accumulated_metrics["reward"] = 0
+    accumulated_metrics["reward_std"] = 0
+    accumulated_metrics["kl"] = 0
+    accumulated_metrics["clip_ratio"] = 0
 
     start = time.perf_counter()
     for it, batch in zip(
@@ -1013,20 +1201,25 @@ def train_grpo(
             if rank == 0:
                 val_metrics_str = (
                     f"Val loss {val_loss:.3f}, "
-                    f"Val total_rewards_mean {val_metrics['total_rewards_mean']:.3f}, "
-                    f"Val total_rewards_std {val_metrics['total_rewards_std']:.3f}, "
-                    f"Val grouped_rewards_mean {val_metrics['grouped_rewards_mean']:.3f}, "
-                    f"Val grouped_rewards_std {val_metrics['grouped_rewards_std']:.3f}, "
-                    f"Val kl {val_metrics['kl']:.3f}, "
-                    f"Val clip_fraction {val_metrics.get('clip_fraction', 0.0):.3f}, "
-                    f"Val length {val_metrics.get('completion_mean_length', 0.0):.1f}"
+                    f"Val reward {val_metrics.get('reward/mean', 0.0):.3f}, "
+                    f"Val reward std {val_metrics.get('reward/std', 0.0):.3f}, "
+                    f"Val grouped reward mean {val_metrics.get('reward/grouped_mean', 0.0):.3f}, "
+                    f"Val grouped reward std {val_metrics.get('reward/grouped_std', 0.0):.3f}, "
+                    f"Val KL {val_metrics.get('policy/kl_mean', 0.0):.3f}, "
+                    f"Val clip ratio {val_metrics.get('policy/clip_ratio', 0.0):.3f}, "
+                    f"Val length {val_metrics.get('completions/mean_length', 0.0):.1f}"
                 )
 
-                for i, reward_func in enumerate(reward_funcs):
-                    val_metrics_str += (
-                        f", Val {reward_func.__name__}_mean {val_metrics[f'{reward_func.__name__}_mean']:.3f}, "
-                        f"Val {reward_func.__name__}_std {val_metrics[f'{reward_func.__name__}_std']:.3f}"
-                    )
+                # Add individual reward function metrics
+                for reward_func in reward_funcs:
+                    func_name = reward_func.__name__
+                    mean_key = f"rewards/{func_name}/mean"
+                    std_key = f"rewards/{func_name}/std"
+                    
+                    if mean_key in val_metrics and std_key in val_metrics:
+                        val_metrics_str += (
+                            f", Val {func_name} {val_metrics[mean_key]:.3f}±{val_metrics[std_key]:.3f}"
+                        )
 
                 print(
                     f"Iter {it}: {val_metrics_str}, " f"Val took {val_time:.3f}s",
@@ -1034,20 +1227,19 @@ def train_grpo(
                 )
 
             if training_callback is not None:
-                # Prepare validation info with hierarchical metrics and sample data
+                # Prepare validation info with hierarchical metrics
                 val_info = {
                     "iteration": it,
                     "val_loss": val_loss,
                     # Preserve the hierarchical structure for metrics
-                    "val_metrics": val_metrics,
-                    # Include samples data for callbacks to use (e.g., WandB)
-                    "validation_samples": val_samples
+                    "val_metrics": val_metrics
                 }
                 
-                training_callback.on_val_loss_report(val_info)
+                # Use enhanced validation_end method with samples data
+                training_callback.on_validation_end(val_info, val_samples)
             
             # Clear cache after validation to prevent memory buildup
-            mx.metal.clear_cache()
+            mx.clear_cache()
             start = time.perf_counter()
 
         loss, toks, metrics = step(batch)
@@ -1055,7 +1247,7 @@ def train_grpo(
         n_tokens += toks
         steps += 1
 
-        mx.metal.clear_cache()
+        mx.clear_cache()
 
         for k, v in metrics.items():
             accumulated_metrics[k] += v
@@ -1075,26 +1267,40 @@ def train_grpo(
             it_sec = args.steps_per_report / (stop - start)
             tokens_sec = float(n_tokens) / (stop - start)
             trained_tokens += n_tokens
-            peak_mem = mx.metal.get_peak_memory() / 1e9
+            # Use appropriate memory tracking based on platform
+            try:
+                # Try the current method
+                peak_mem = mx.get_peak_memory() / 1e9
+            except AttributeError:
+                # Fall back to metal method if necessary
+                try:
+                    peak_mem = mx.metal.get_peak_memory() / 1e9
+                except AttributeError:
+                    # Provide a default if neither method works
+                    peak_mem = 0.0
 
             if rank == 0:
                 train_metrics_str = (
                     f"Train loss {train_loss:.3f}, "
-                    f"Total rewards mean {avg_metrics['total_rewards_mean']:.3f}, "
-                    f"Total rewards std {avg_metrics['total_rewards_std']:.3f}, "
-                    f"Grouped rewards mean {avg_metrics['grouped_rewards_mean']:.3f}, "
-                    f"Grouped rewards std {avg_metrics['grouped_rewards_std']:.3f}, "
-                    f"KL {avg_metrics['kl']:.3f}, "
-                    f"Clip fraction {avg_metrics.get('clip_fraction', 0.0):.3f}, "
-                    f"Avg length {avg_metrics.get('completion_mean_length', 0.0):.1f}"
+                    f"Reward {avg_metrics.get('reward/mean', 0.0):.3f}, "
+                    f"Reward std {avg_metrics.get('reward/std', 0.0):.3f}, "
+                    f"Grouped reward mean {avg_metrics.get('reward/grouped_mean', 0.0):.3f}, "
+                    f"Grouped reward std {avg_metrics.get('reward/grouped_std', 0.0):.3f}, "
+                    f"KL {avg_metrics.get('policy/kl_mean', 0.0):.3f}, "
+                    f"Clip ratio {avg_metrics.get('policy/clip_ratio', 0.0):.3f}, "
+                    f"Avg length {avg_metrics.get('completions/mean_length', 0.0):.1f}"
                 )
 
-                for i, reward_func in enumerate(reward_funcs):
+                # Add individual reward function metrics
+                for reward_func in reward_funcs:
                     func_name = reward_func.__name__
-                    train_metrics_str += (
-                        f", {func_name} mean {avg_metrics[f'{func_name}_mean']:.3f}, "
-                        f"{func_name} std {avg_metrics[f'{func_name}_std']:.3f}"
-                    )
+                    mean_key = f"rewards/{func_name}/mean"
+                    std_key = f"rewards/{func_name}/std"
+                    
+                    if mean_key in avg_metrics and std_key in avg_metrics:
+                        train_metrics_str += (
+                            f", {func_name} {avg_metrics[mean_key]:.3f}±{avg_metrics[std_key]:.3f}"
+                        )
 
                 print(
                     f"Iter {it}: {train_metrics_str}, "
@@ -1106,12 +1312,17 @@ def train_grpo(
                 )
 
             if training_callback is not None:
-                # Prepare training info with system metrics and hierarchical metrics
+                # Prepare refined training info with hierarchical structure following TRL naming
                 train_info = {
                     "iteration": it,
                     "train_loss": train_loss,
-                    # Preserve the hierarchical structure for metrics
-                    "train_metrics": avg_metrics,
+                    
+                    # Use standardized hierarchical metrics structure
+                    "train_metrics": {
+                        # Use normalized keys to match TRL structure
+                        k.replace("_", "/"): v for k, v in avg_metrics.items()
+                    },
+                    
                     # System metrics
                     "system": {
                         "learning_rate": learning_rate,

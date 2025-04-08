@@ -73,27 +73,37 @@ class WandBCallback(TrainingCallback):
         Args:
             train_info: Dictionary with train metrics and system info
         """
-        # Convert train_info for proper logging format
-        if "train_metrics" in train_info:
-            # Handle hierarchical metrics structure
-            log_data = {
-                f"train/{k}": v for k, v in train_info["train_metrics"].items()
-            }
-            # Add non-metrics fields
-            for k, v in train_info.items():
-                if k != "train_metrics" and k != "system":
-                    log_data[f"train/{k}"] = v
-                    
-            # Handle system metrics separately
-            if "system" in train_info:
-                for k, v in train_info["system"].items():
-                    log_data[f"system/{k}"] = v
-        else:
-            # Legacy format - convert flat dict to hierarchical
-            log_data = {f"train/{k}": v for k, v in train_info.items()}
+        try:
+            import mlx.core as mx
             
-        # Log with step if available
-        wandb.log(_convert_arrays(log_data), step=train_info.get("iteration"))
+            try:
+                rank = mx.distributed.get_rank()
+            except:
+                rank = 0
+                
+            # Convert train_info for proper logging format
+            if "train_metrics" in train_info:
+                # Handle hierarchical metrics structure
+                log_data = {
+                    f"train/{k}": v for k, v in train_info["train_metrics"].items()
+                }
+                # Add non-metrics fields
+                for k, v in train_info.items():
+                    if k != "train_metrics" and k != "system":
+                        log_data[f"train/{k}"] = v
+                        
+                # Handle system metrics separately
+                if "system" in train_info:
+                    for k, v in train_info["system"].items():
+                        log_data[f"system/{k}"] = v
+            else:
+                # Legacy format - convert flat dict to hierarchical
+                log_data = {f"train/{k}": v for k, v in train_info.items()}
+                
+            # Log with step if available
+            wandb.log(_convert_arrays(log_data), step=train_info.get("iteration"))
+        except Exception as e:
+            print(f"Warning: Failed to log training metrics to WandB: {e}")
         
         # Chain to wrapped callback if exists
         if self.wrapped_callback:
@@ -147,34 +157,169 @@ class WandBCallback(TrainingCallback):
             # Process sample data if available
             if val_samples and wandb:
                 try:
-                    # Create table for prompt/completion examples
-                    columns = ["Prompt", "Completion", "Answer", "Reward"]
+                    # Select samples using strategy from user documentation
+                    # Default to 8 samples or user-configured number
+                    num_samples = min(8, len(val_samples["prompts"]))
+                    indices_to_log = set()
+                    
+                    if len(val_samples["prompts"]) > 0:
+                        # Get indices for min/max samples to understand the range
+                        rewards_array = mx.array(val_samples["rewards"])
+                        best_idx = rewards_array.argmax().item()
+                        worst_idx = rewards_array.argmin().item()
+                        indices_to_log.add(best_idx)
+                        indices_to_log.add(worst_idx)
+                        
+                        # Get samples at different quality levels to understand distribution
+                        if len(rewards_array) > 3:
+                            sorted_indices = mx.argsort(rewards_array)
+                            # Get median (50th percentile)
+                            median_idx = sorted_indices[len(sorted_indices) // 2].item()
+                            indices_to_log.add(median_idx)
+                            
+                            # Get 25th and 75th percentiles for a more complete distribution view
+                            p25_idx = sorted_indices[len(sorted_indices) // 4].item()
+                            p75_idx = sorted_indices[3 * len(sorted_indices) // 4].item()
+                            indices_to_log.add(p25_idx)
+                            indices_to_log.add(p75_idx)
+                            
+                        # Look for interesting outliers in advantage
+                        if "advantages" in val_samples and len(val_samples["advantages"]) > 0:
+                            advantages_array = mx.array(val_samples["advantages"])
+                            # Add samples with highest advantage (unexpectedly good)
+                            high_adv_idx = advantages_array.argmax().item()
+                            # Add samples with lowest advantage (unexpectedly bad)
+                            low_adv_idx = advantages_array.argmin().item()
+                            indices_to_log.add(high_adv_idx)
+                            indices_to_log.add(low_adv_idx)
+                        
+                        # Add samples with extremes for individual reward functions
+                        if "individual_rewards" in val_samples and val_samples["individual_rewards"]:
+                            for func_name, rewards in val_samples["individual_rewards"].items():
+                                func_rewards = mx.array(rewards)
+                                # Get best and worst for this specific reward function
+                                func_best_idx = func_rewards.argmax().item()
+                                func_worst_idx = func_rewards.argmin().item()
+                                # Only add if we haven't reached our limit yet
+                                if len(indices_to_log) < num_samples:
+                                    indices_to_log.add(func_best_idx)
+                                if len(indices_to_log) < num_samples:
+                                    indices_to_log.add(func_worst_idx)
+                        
+                        # Add random samples to reach desired count if needed
+                        import random
+                        if len(indices_to_log) < num_samples:
+                            all_indices = set(range(len(val_samples["prompts"])))
+                            remaining_indices = all_indices - indices_to_log
+                            random_indices = random.sample(
+                                remaining_indices, 
+                                min(num_samples - len(indices_to_log), len(remaining_indices))
+                            )
+                            indices_to_log.update(random_indices)
+                    
+                    # Create rich WandB table for reward function analysis as described in user experience doc
+                    columns = [
+                        "ID",                # For reference in the table
+                        "BatchIdx",          # To track batches
+                        "PromptIdx",         # To group completions for same prompt
+                        "Prompt",            # Input context
+                        "Completion",        # Model generation
+                        "Answer",            # Ground truth (if available)
+                        "Combined_Reward",   # Final combined reward score
+                        "Advantage",         # Calculated advantage vs other completions
+                        "Length",            # Completion length
+                        "KL_Divergence",     # KL from reference policy (if tracked)
+                    ]
+                    
+                    # Add columns for individual reward functions with consistent naming
+                    if "individual_rewards" in val_samples:
+                        for func_name in val_samples["individual_rewards"]:
+                            # Add standardized column name for this reward function
+                            columns.append(f"{func_name}_Reward")
+                    
                     data = []
                     
-                    # Extract data for table
-                    sample_count = min(10, len(val_samples["prompts"]))  # Limit to 10 samples
-                    for i in range(sample_count):
-                        data.append([
-                            val_samples["prompts"][i],
-                            val_samples["completions"][i],
-                            val_samples["answers"][i] if "answers" in val_samples else "",
-                            val_samples["rewards"][i].item() if "rewards" in val_samples else 0.0
-                        ])
+                    # Build rows from selected indices with rich metadata for sorting/filtering in WandB
+                    for i, idx in enumerate(sorted(indices_to_log)):
+                        # Start with metadata and core values
+                        row = [
+                            i,  # ID for reference
+                            val_samples["batch_indices"][idx] if "batch_indices" in val_samples and idx < len(val_samples["batch_indices"]) else 0,
+                            val_samples["prompt_indices"][idx] if "prompt_indices" in val_samples and idx < len(val_samples["prompt_indices"]) else 0,
+                            val_samples["prompts"][idx],
+                            val_samples["completions"][idx],
+                            val_samples["answers"][idx] if "answers" in val_samples and idx < len(val_samples["answers"]) else "",
+                            val_samples["rewards"][idx] if isinstance(val_samples["rewards"][idx], (float, int)) else val_samples["rewards"][idx].item(),
+                            val_samples["advantages"][idx] if "advantages" in val_samples and idx < len(val_samples["advantages"]) else 0.0,
+                            val_samples["completion_lengths"][idx] if "completion_lengths" in val_samples and idx < len(val_samples["completion_lengths"]) else 0,
+                            val_samples["kl_div_per_sample"][idx] if "kl_div_per_sample" in val_samples and idx < len(val_samples["kl_div_per_sample"]) else 0.0,
+                        ]
+                        
+                        # Add individual reward values for deep analysis
+                        if "individual_rewards" in val_samples:
+                            for func_name in val_samples["individual_rewards"]:
+                                if idx < len(val_samples["individual_rewards"][func_name]):
+                                    value = val_samples["individual_rewards"][func_name][idx]
+                                    # Handle different value types
+                                    if isinstance(value, (float, int)):
+                                        row.append(value)
+                                    else:
+                                        row.append(value.item())
+                                else:
+                                    row.append(0.0)  # Default if index out of range
+                        
+                        data.append(row)
                     
                     # Create and add table
                     table = wandb.Table(columns=columns, data=data)
                     log_data["validation/samples"] = table
                     
-                    # Add histogram of rewards if available
-                    if "rewards" in val_samples:
-                        log_data["validation/reward_dist"] = wandb.Histogram(
-                            val_samples["rewards"].tolist()
-                        )
+                    # Enhanced histograms for detailed reward distribution analysis
+                    try:
+                        # Primary metrics histograms
+                        histograms = {
+                            # Combined reward shows overall distribution
+                            "validation/dist/combined_reward": wandb.Histogram(val_samples["rewards"]),
+                            
+                            # Advantage shows how completions compare to others for same prompt
+                            "validation/dist/advantage": wandb.Histogram(val_samples["advantages"]) if "advantages" in val_samples else None,
+                            
+                            # Completion length distribution helps understand generation patterns
+                            "validation/dist/completion_length": wandb.Histogram(val_samples["completion_lengths"]) if "completion_lengths" in val_samples else None,
+                            
+                            # KL divergence shows how much policy deviates from reference
+                            "validation/dist/kl_divergence": wandb.Histogram(val_samples["kl_div_per_sample"]) if "kl_div_per_sample" in val_samples else None,
+                        }
+                        
+                        # Add individual reward function histograms for component analysis
+                        if "individual_rewards" in val_samples:
+                            for func_name, rewards in val_samples["individual_rewards"].items():
+                                if rewards and len(rewards) > 0:
+                                    # Use standardized naming for reward function histograms
+                                    histograms[f"validation/dist/rewards/{func_name}"] = wandb.Histogram(rewards)
+                        
+                        # Add all valid histograms to log data
+                        for hist_name, hist_obj in histograms.items():
+                            if hist_obj is not None:
+                                log_data[hist_name] = hist_obj
+                    except Exception as e:
+                        print(f"Warning: Error creating histograms: {e}")
+                    
+                    # Add summary statistics if available
+                    if "stats" in val_samples:
+                        for stat_name, stat_value in val_samples["stats"].items():
+                            log_data[f"validation/stats/{stat_name}"] = stat_value
+                            
                 except Exception as e:
                     print(f"Warning: Failed to process validation samples: {e}")
+                    import traceback
+                    traceback.print_exc()
                     
             # Log data
-            wandb.log(_convert_arrays(log_data), step=val_info.get("iteration"))
+            try:
+                wandb.log(_convert_arrays(log_data), step=val_info.get("iteration"))
+            except Exception as e:
+                print(f"Warning: Failed to log to WandB: {e}")
             
         # Chain to wrapped callback if exists
         if self.wrapped_callback:
@@ -183,15 +328,51 @@ class WandBCallback(TrainingCallback):
 
 def _convert_arrays(info):
     """
-    Recursively traverses a dictionary and converts mlx.core.array types to lists.
-    This is to prevent wandb's json encoding from failing on mlx.core.array instances.
+    Simple conversion of MLX arrays to JSON-serializable types.
     """
     import mlx.core
+    import numpy as np
+
+    # Handle None
+    if info is None:
+        return None
+        
+    # Handle dicts
     if isinstance(info, dict):
         return {k: _convert_arrays(v) for k, v in info.items()}
+        
+    # Handle lists
     elif isinstance(info, list):
         return [_convert_arrays(item) for item in info]
+        
+    # Handle MLX arrays
     elif isinstance(info, mlx.core.array):
-        return info.tolist()
-    else:
+        try:
+            # For single values, convert to Python scalar
+            if info.size == 1:
+                return float(info.item())
+            # For arrays, convert to list
+            return [float(x) for x in info.tolist()]
+        except:
+            # If conversion fails, use a string placeholder
+            return "MLX_ARRAY"
+            
+    # Handle numpy arrays
+    elif isinstance(info, np.ndarray):
+        try:
+            if info.size == 1:
+                return float(info.item())
+            return [float(x) for x in info.tolist()]
+        except:
+            return "NP_ARRAY"
+            
+    # Handle basic Python types
+    elif isinstance(info, (int, float, str, bool)):
         return info
+        
+    # Last resort: string conversion
+    else:
+        try:
+            return str(info)
+        except:
+            return "UNKNOWN_TYPE"
