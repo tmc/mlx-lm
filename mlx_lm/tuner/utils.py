@@ -277,3 +277,44 @@ def print_trainable_parameters(model):
         f"Trainable parameters: {(trainable_p * 100 / total_p):.3f}% "
         f"({trainable_p:.3f}M/{total_p:.3f}M)"
     )
+
+
+def broadcast_string(s: Optional[str], group: Optional[mx.distributed.Group] = None) -> str:
+    """Broadcasts a string from root (rank 0) to all ranks in the group.
+    
+    Args:
+        s: String to broadcast from rank 0, or None on other ranks
+        group: Distributed group to use, defaults to global group
+        
+    Returns:
+        The broadcasted string on all ranks
+    """
+    from typing import Optional
+    
+    group = group or mx.distributed.init()
+    rank = group.rank()
+    
+    data_list = None
+    if rank == 0:
+        s = s or ""  # Handle None case
+        encoded_s = s.encode('utf-8')
+        data_list = list(encoded_s)
+    
+    # Determine size and broadcast it
+    size = mx.array(len(data_list) if rank == 0 else 0)
+    size = mx.distributed.broadcast(size, root=0, group=group).item()
+    
+    # Prepare data array
+    if rank == 0:
+        data_to_broadcast = mx.array(data_list, dtype=mx.uint8)
+    else:
+        # Non-root ranks need a placeholder array of the correct size and type
+        data_to_broadcast = mx.zeros((size,), dtype=mx.uint8)
+        
+    # Broadcast the actual data
+    broadcasted_data = mx.distributed.broadcast(data_to_broadcast, root=0, group=group)
+    mx.eval(broadcasted_data)  # Ensure completion
+    
+    # Decode on all ranks
+    decoded_s = bytes(broadcasted_data.tolist()).decode('utf-8')
+    return decoded_s
