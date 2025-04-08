@@ -670,12 +670,16 @@ def train_grpo(
     if world_size > 1:
         print(f"Node {rank} of {world_size}")
 
-    if args.grad_checkpoint:
+    if args.grad_checkpoint and hasattr(model, "layers") and len(model.layers) > 0:
         grad_checkpoint(model.layers[0])
 
-    state = [model.state, optimizer.state]
+    state = [model.state, optimizer.state, mx.random.state]
 
     def step(batch):
+        # Set model to training mode
+        if hasattr(model, "train"):
+            model.train()
+        
         prompt_tokens, targets, prompt_lens, target_lens = batch
         
         all_completions, all_completion_texts, batch_indices = generate_grpo(
@@ -737,6 +741,11 @@ def train_grpo(
     ):
         if it == 1 or it % args.steps_per_eval == 0 or it == args.iters:
             stop = time.perf_counter()
+            
+            # Set model to evaluation mode
+            if hasattr(model, "eval"):
+                model.eval()
+                
             val_loss, val_ntokens, val_metrics = evaluate_grpo(
                 model=model,
                 dataset=val_dataset,
@@ -755,6 +764,10 @@ def train_grpo(
                 temperature=args.temperature,
                 iterate_batches=iterate_batches,
             )
+            
+            # Set model back to training mode
+            if hasattr(model, "train"):
+                model.train()
             val_time = time.perf_counter() - stop
             if rank == 0:
                 val_metrics_str = (
