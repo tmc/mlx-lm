@@ -35,7 +35,7 @@ class GRPOTrainingArgs(TrainingArgs):
         default=1e-4, metadata={"help": "The Epsilon for numerical stability."}
     )
     max_completion_length: int = field(
-        default=512, metadata={"help": "Number of Generations."}
+        default=512, metadata={"help": "Number of tokens to generate per completion."}
     )
     reference_model_path: str = field(
         default=None,
@@ -57,14 +57,20 @@ class GRPOTrainingArgs(TrainingArgs):
     )
 
 
-def get_per_token_logps(model: nn.Module, inputs, lengths):
+def get_per_token_logps(model: nn.Module, inputs, lengths, temperature=1.0):
     logits = model(inputs).astype(mx.float16)
     logits = logits[:, :-1, :]
     targets = inputs[:, 1:]
     per_token_logps = []
     for i in range(logits.shape[0]):
         seq_len = int(lengths[i]) - 1
+        if seq_len <= 0:
+            # Handle empty or single token sequences
+            per_token_logps.append(mx.array([], dtype=mx.float32))
+            continue
         seq_logits = logits[i, :seq_len]
+        # Scale logits by temperature before softmax
+        seq_logits = seq_logits / temperature
         seq_targets = targets[i, :seq_len]
         log_probs = nn.log_softmax(seq_logits, axis=-1)
         token_log_probs = mx.take_along_axis(
@@ -84,6 +90,11 @@ def generate_step(
     max_kv_size: Optional[int] = None,
     prompt_cache: Optional[Any] = None,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
+    if sampler is None:
+        # Default to argmax if no sampler is provided
+        def sampler(logprobs):
+            return mx.argmax(logprobs, axis=-1)
+    
     tokens = None
     y = prompt
     if prompt_cache is None:
@@ -320,7 +331,7 @@ def grpo_loss(
         )
         all_func_rewards.append(func_rewards)
 
-    rewards = mx.stack(all_func_rewards, axis=1)
+    rewards_matrix = mx.stack(all_func_rewards, axis=1)
 
     if reward_weights is not None:
         if len(reward_weights) != len(reward_funcs):
@@ -332,7 +343,8 @@ def grpo_loss(
     else:
         reward_weights = mx.ones(len(reward_funcs), dtype=mx.float32)
 
-    rewards = (rewards * mx.expand_dims(reward_weights, 0)).sum(axis=1)
+    # Apply reward weights to the reward matrix
+    rewards = (rewards_matrix * mx.expand_dims(reward_weights, 0)).sum(axis=1)
 
     num_unique_prompts = len(unique_prompt_indices)
 
@@ -734,7 +746,9 @@ def train_grpo(
                         "val_time": val_time,
                     }
                 )
-
+            
+            # Clear cache after validation to prevent memory buildup
+            mx.metal.clear_cache()
             start = time.perf_counter()
 
         loss, toks, metrics = step(batch)
@@ -809,8 +823,12 @@ def train_grpo(
             steps = 0
             start = time.perf_counter()
 
-        if it % args.steps_per_save == 0:
+        if it % args.steps_per_save == 0 and rank == 0:
             adapter_weights = dict(tree_flatten(model.trainable_parameters()))
+            
+            # Ensure parent directory exists
+            Path(args.adapter_file).parent.mkdir(parents=True, exist_ok=True)
+            
             mx.save_safetensors(str(args.adapter_file), adapter_weights)
             checkpoint = (
                 Path(args.adapter_file).parent / f"{it:07d}_adapters.safetensors"
@@ -821,6 +839,7 @@ def train_grpo(
                 f"{args.adapter_file} and {checkpoint}."
             )
 
-    adapter_weights = dict(tree_flatten(model.trainable_parameters()))
-    mx.save_safetensors(str(args.adapter_file), adapter_weights)
-    print(f"Saved final weights to {args.adapter_file}.")
+    if rank == 0:
+        adapter_weights = dict(tree_flatten(model.trainable_parameters()))
+        mx.save_safetensors(str(args.adapter_file), adapter_weights)
+        print(f"Saved final weights to {args.adapter_file}.")
