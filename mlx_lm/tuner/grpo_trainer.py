@@ -581,8 +581,9 @@ def evaluate_grpo(
     loss_fn: callable = grpo_loss,
     iterate_batches: callable = iterate_grpo_batches,
 ):
-    all_losses = 0
-    ntokens = 0
+    # Use mx.array for accumulating values to ensure correct distributed behavior
+    all_losses = mx.array(0.0, dtype=mx.float32)
+    ntokens = mx.array(0, dtype=mx.int32)
     all_metrics = None
 
     index_iterator = iter(range(num_batches)) if num_batches != -1 else iter(int, 1)
@@ -614,13 +615,14 @@ def evaluate_grpo(
         ntokens += toks
 
         if all_metrics is None:
-            all_metrics = {k: v * toks for k, v in metrics.items()}
+            all_metrics = {k: mx.array(v * toks, dtype=mx.float32) for k, v in metrics.items()}
         else:
             for k, v in metrics.items():
                 all_metrics[k] += v * toks
 
         mx.eval(all_losses, ntokens)
 
+    # Aggregate metrics across all workers
     all_losses = mx.distributed.all_sum(all_losses, stream=mx.cpu)
     ntokens = mx.distributed.all_sum(ntokens, stream=mx.cpu)
     all_metrics = {k: mx.distributed.all_sum(v) for k, v in all_metrics.items()}
