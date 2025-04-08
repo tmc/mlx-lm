@@ -470,35 +470,40 @@ def grpo_loss(
     }
 
     if is_validation and all_completion_texts:
-        print("\n=== Validation Sample Details ===")
+        try:
+            print("\n=== Validation Sample Details ===")
 
-        # Print the input context (prompt)
-        last_prompt_idx = batch_indices[-1] if batch_indices else 0
+            # Print the input context (prompt)
+            last_prompt_idx = batch_indices[-1] if batch_indices else 0
 
-        if last_prompt_idx < len(prompt_text):
-            print(f"\n📋 Raw Prompt:\n{prompt_text[last_prompt_idx]}")
-            print("\n" + "=" * 10 + "\n")
-
-            # Get the actual tokenized prompt that was fed to the model
-            if last_prompt_idx < len(prompt_tokens):
-                actual_prompt = tokenizer.decode(prompt_tokens[last_prompt_idx])
-                print(f"\n🔄 Model Input:\n{actual_prompt}")
+            if last_prompt_idx < len(prompt_text):
+                print(f"\n📋 Raw Prompt:\n{prompt_text[last_prompt_idx]}")
                 print("\n" + "=" * 10 + "\n")
 
-        print(f"\n📝 Generation:\n{all_completion_texts[-1]}")
-        print("\n" + "=" * 10 + "\n")
+                # Get the actual tokenized prompt that was fed to the model
+                if last_prompt_idx < len(prompt_tokens):
+                    actual_prompt = tokenizer.decode(prompt_tokens[last_prompt_idx])
+                    print(f"\n🔄 Model Input:\n{actual_prompt}")
+                    print("\n" + "=" * 10 + "\n")
 
-        # Make sure we have a valid index for answer_text
-        if last_prompt_idx < len(answer_text):
-            print(f"\n✅ Answer:\n{answer_text[last_prompt_idx]}")
-            print("\n" + "=" * 10 + "\n")
+            if all_completion_texts:
+                print(f"\n📝 Generation:\n{all_completion_texts[-1]}")
+                print("\n" + "=" * 10 + "\n")
 
-        # Only try to extract if r1_extract_xml_answer is defined
-        if "r1_extract_xml_answer" in globals():
-            print(
-                f"\n🔍 Extracted Answer:\n{r1_extract_xml_answer(all_completion_texts[-1])}"
-            )
-        print("\n" + "=" * 35 + "\n")
+            # Make sure we have a valid index for answer_text
+            if last_prompt_idx < len(answer_text):
+                print(f"\n✅ Answer:\n{answer_text[last_prompt_idx]}")
+                print("\n" + "=" * 10 + "\n")
+
+            # Only try to extract if r1_extract_xml_answer is defined
+            if "r1_extract_xml_answer" in globals() and all_completion_texts:
+                print(
+                    f"\n🔍 Extracted Answer:\n{r1_extract_xml_answer(all_completion_texts[-1])}"
+                )
+            print("\n" + "=" * 35 + "\n")
+        except Exception as e:
+            print(f"\nError printing validation details: {e}")
+            print("Continuing with training...\n")
 
     mx.metal.clear_cache()
 
