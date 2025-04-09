@@ -1,7 +1,8 @@
 import json
 import types
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from dataclasses import dataclass, field
+from typing import List, Dict, Any, Optional, Tuple
 
 from transformers import PreTrainedTokenizer
 
@@ -154,52 +155,294 @@ class CacheDataset:
         return len(self._data)
 
 
+# Define the default system prompt text
+DEFAULT_R1_SYSTEM_PROMPT = (
+    "A conversation between User and Assistant. The User asks a question, "
+    "and the Assistant solves it. The Assistant first thinks about the reasoning process "
+    "in the mind and then provides the User with the answer. The reasoning process is "
+    "enclosed within <think> </think> and answer is enclosed within <answer> </answer> "
+    "tags, respectively, i.e., <think> reasoning process here </think> <answer> answer here </answer>."
+)
+
+Message = Dict[str, str]
+
+@dataclass
 class GRPODataset:
     """
-    Dataset wrapper for GRPO training data.
-    Each example should have a 'prompt' and 'answer' field.
-    Returns data in (prompt_tokens, answer_tokens, prompt_str, answer_str) tuple format.
-    """
-    def __init__(
-        self,
-        data: List[Dict[str, str]],
-        tokenizer: PreTrainedTokenizer,
-        prompt_key: str = "prompt",
-        answer_key: str = "answer",
-        system_key: str = "system",
-        use_chat_template: bool = False,
-        use_prompt: bool = False
-    ):
-        self._data = []
-        for item in data:
-            prompt_str = str(item[prompt_key])
-            answer_str = str(item[answer_key])
-            if use_chat_template:
-                default_system_str = "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think><answer> answer here </answer>."
-                system_str = item.get(system_key, default_system_str)
-                prompt_tokens = tokenizer.apply_chat_template(
-                    [
-                        {'role': 'system', 'content': system_str},
-                        {'role': 'user', 'content': prompt_str}
-                    ],
-                    add_generation_prompt=True
-                )
-                answer_tokens = tokenizer.encode(answer_str)
-            else:
-                if use_prompt:
-                    prompt_tokens = tokenizer.encode(f"""A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think><answer> answer here </answer>. User: {prompt_str} Assistant: """)
-                else:
-                    prompt_tokens = tokenizer.encode(prompt_str)
-                answer_tokens = tokenizer.encode(answer_str)
-            self._data.append((prompt_tokens, answer_tokens, prompt_str, answer_str))
+    Simplified dataset for GRPO training (eager processing, using print).
 
-    def __getitem__(self, idx: int) -> Tuple[List[int], List[int], str, str]:
-        return self._data[idx]
+    Processes prompt/answer or chat formats, handling system prompts and prefill
+    according to precedence rules during initialization. Stores processed tokenized data.
+
+    - System Prompt Precedence: forced > key > messages[0] > default_arg > DEFAULT_R1_SYSTEM_PROMPT
+    - Prefill Precedence: forced > messages[-1] > default_arg > ""
+
+    Returns: (prompt_tokens, answer_tokens, prompt_str_for_reward, answer_str, system_prompt, prefill)
+    """
+
+    # --- Configuration ---
+    data: List[Dict[str, Any]] = field(repr=False)
+    tokenizer: Any = field(repr=False)
+    prompt_key: str = "prompt"
+    answer_key: str = "answer"
+    messages_key: str = "messages"
+    system_prompt_key: Optional[str] = None
+    forced_system_prompt: Optional[str] = None
+    default_system_prompt_arg: Optional[str] = None
+    use_chat_template: bool = True
+    forced_assistant_prefill: Optional[str] = None
+    default_assistant_prefill_arg: Optional[str] = None
+    compress_system_to_user: bool = False
+
+    # --- Internal State ---
+    _processed_data: List[Tuple[List[int], List[int], str, str, str, str]] = field(init=False, default_factory=list, repr=False)
+
+    def __post_init__(self):
+        """Initialize tokenizer padding and process all data items."""
+        if self.tokenizer.pad_token_id is None:
+            # Replaced logger.warning
+            print("[Warning] Tokenizer missing pad token ID. Using EOS token ID.")
+            self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+
+        initial_count = len(self.data) # Use self.data
+        # Replaced logger.info
+        print(f"[GRPODataset] Initializing and processing {initial_count} items...")
+        # Log config concisely
+        config_summary = (
+            f"Use Chat Template: {self.use_chat_template}, "
+            f"Compress System: {self.compress_system_to_user}, "
+            f"Forced SysPrompt: {'Yes' if self.forced_system_prompt else 'No'}, "
+            f"Forced Prefill: {'Yes' if self.forced_assistant_prefill else 'No'}"
+        )
+        # Replaced logger.info
+        print(f"[GRPODataset] Config: {config_summary}")
+
+
+        processed_count = 0
+        skipped_indices = []
+        for index, item in enumerate(self.data): # Use self.data
+            try:
+                processed_item = self._process_single_item(item, index)
+                if processed_item:
+                    self._processed_data.append(processed_item)
+                    processed_count += 1
+                else:
+                    skipped_indices.append(index) # Reason already printed in _process_single_item
+            except Exception as e:
+                # Replaced logger.error with exc_info=True
+                print(f"[Error] Error processing item {index}: {e}. Skipping.")
+                # Optionally print traceback if needed:
+                # import traceback
+                # traceback.print_exc()
+                skipped_indices.append(index)
+
+        # Report outcome
+        skipped_count = len(skipped_indices)
+        if skipped_count > 0:
+            # Replaced logger.warning
+            print(f"[Warning][GRPODataset] Processed {processed_count}/{initial_count} items. "
+                  f"{skipped_count} items skipped (e.g., indices: {skipped_indices[:10]}{'...' if skipped_count > 10 else ''}).")
+        else:
+             # Replaced logger.info
+            print(f"[GRPODataset] Successfully processed all {processed_count} items.")
+
+        # Release raw data reference if no longer needed
+        del self.data # Use self.data
+
+    def _determine_system_prompt(self, item: Dict[str, Any]) -> Tuple[Optional[str], str]:
+        """Helper to determine the effective system prompt (keeps precedence logic clear)."""
+        # (No logging needed here, logic remains the same)
+        source = "none" ; system_prompt = None
+
+        if self.forced_system_prompt is not None:
+            return self.forced_system_prompt, "cli_forced"
+
+        if self.system_prompt_key and self.system_prompt_key in item:
+            return str(item[self.system_prompt_key]), "data_key"
+
+        messages = item.get(self.messages_key)
+        if isinstance(messages, list) and messages and messages[0].get("role") == "system":
+            return messages[0].get("content", ""), "data_messages"
+
+        if self.default_system_prompt_arg is not None:
+            return self.default_system_prompt_arg, "cli_default"
+
+        return DEFAULT_R1_SYSTEM_PROMPT, "hardcoded_default"
+
+    def _process_single_item(self, item: Dict[str, Any], index: int) -> Optional[Tuple[List[int], List[int], str, str, str, str]]:
+        """Processes a single item, including determining inputs, prefill, answer, and tokenizing."""
+
+        # --- 1. Determine System Prompt ---
+        effective_system_prompt, system_source = self._determine_system_prompt(item)
+
+        # --- 2. Extract Content Messages & Base Answer/Prefill ---
+        prompt_content_messages = []
+        data_prefill_content: Optional[str] = None
+        answer_str = ""
+        prompt_str_for_reward_base = "" # Base string before adding system prompt potentially
+
+        original_messages = item.get(self.messages_key)
+        start_index = 1 if system_source == "data_messages" else 0
+        data_ends_with_assistant = False
+
+        if isinstance(original_messages, list) and original_messages:
+            # Using 'messages' format
+            content_messages = list(original_messages[start_index:])
+            if content_messages and content_messages[-1].get("role") == "assistant":
+                data_ends_with_assistant = True
+                data_prefill_content = content_messages[-1].get("content", "")
+                prompt_content_messages = content_messages[:-1]
+                answer_str = str(item.get(self.answer_key, data_prefill_content))
+            else:
+                prompt_content_messages = content_messages
+                answer_str = str(item.get(self.answer_key, ""))
+            prompt_str_for_reward_base = json.dumps(prompt_content_messages)
+
+        elif self.prompt_key in item:
+            # Using 'prompt'/'answer' format
+            prompt_content = str(item[self.prompt_key])
+            answer_str = str(item.get(self.answer_key, ""))
+            prompt_content_messages = [{"role": "user", "content": prompt_content}]
+            prompt_str_for_reward_base = prompt_content
+
+        else:
+            # Replaced logger.warning
+            print(f"[Warning] Skipping item {index}: Lacks required keys ('{self.messages_key}' or '{self.prompt_key}').")
+            return None
+
+        # --- 3. Determine Effective Prefill ---
+        effective_prefill = ""
+        prefill_source = "none"
+        if self.forced_assistant_prefill is not None:
+            effective_prefill = self.forced_assistant_prefill ; prefill_source = "cli_forced"
+        elif data_ends_with_assistant and data_prefill_content is not None:
+            effective_prefill = data_prefill_content ; prefill_source = "data_messages"
+        elif self.default_assistant_prefill_arg is not None:
+            effective_prefill = self.default_assistant_prefill_arg ; prefill_source = "cli_default"
+
+        # --- 4. Validate Answer Existence ---
+        if not answer_str and prefill_source not in ["cli_forced", "cli_default", "data_messages"]:
+             # Replaced logger.warning
+            print(f"[Warning] Skipping item {index}: Missing target answer/prefill. Needs '{self.answer_key}' or a valid prefill source.")
+            return None
+
+        # --- 5. Build Final Tokenizer Input Messages & Reward String ---
+        messages_for_template: List[Message] = []
+        processed_content_messages = [m.copy() for m in prompt_content_messages]
+
+        # Add/Compress System Prompt
+        if effective_system_prompt:
+            if self.compress_system_to_user:
+                first_user_idx = next((i for i, msg in enumerate(processed_content_messages) if msg.get("role") == "user"), -1)
+                if first_user_idx != -1:
+                    original_content = processed_content_messages[first_user_idx].get("content", "")
+                    processed_content_messages[first_user_idx]["content"] = f"System: {effective_system_prompt}\n\nUser: {original_content}"
+                else:
+                    processed_content_messages.insert(0, {"role": "user", "content": f"System: {effective_system_prompt}\n\nUser: "})
+            else:
+                messages_for_template.append({"role": "system", "content": effective_system_prompt})
+
+        messages_for_template.extend(processed_content_messages)
+
+        # Add assistant role+content for prefill if using chat template
+        if effective_prefill and self.use_chat_template:
+             messages_for_template.append({"role": "assistant", "content": effective_prefill})
+
+        # Construct final reward string
+        final_prompt_str_for_reward = prompt_str_for_reward_base
+        if effective_system_prompt and system_source != "data_messages":
+            try:
+                reward_list = json.loads(prompt_str_for_reward_base)
+                if isinstance(reward_list, list):
+                    reward_list.insert(0, {"role": "system", "content": effective_system_prompt})
+                    final_prompt_str_for_reward = json.dumps(reward_list)
+                else:
+                     final_prompt_str_for_reward = f"System: {effective_system_prompt}\n\n{prompt_str_for_reward_base}"
+            except json.JSONDecodeError:
+                 final_prompt_str_for_reward = f"System: {effective_system_prompt}\n\n{prompt_str_for_reward_base}"
+
+
+        # --- 6. Tokenization ---
+        try:
+            prompt_tokens, answer_tokens = self._tokenize(
+                messages_for_template, effective_prefill, answer_str, index
+            )
+        except ValueError as e:
+             # Replaced logger.warning
+             print(f"[Warning] Skipping item {index}: Tokenization failed. Reason: {e}")
+             return None
+        except Exception as e: # Catch unexpected tokenizer errors
+            # Replaced logger.error
+            print(f"[Error] Skipping item {index}: Unexpected error during tokenization: {e}")
+            return None
+
+        # --- 7. Return processed data ---
+        return (
+            prompt_tokens,
+            answer_tokens,
+            final_prompt_str_for_reward,
+            answer_str,
+            effective_system_prompt or "",
+            effective_prefill
+        )
+
+    def _tokenize(
+        self, messages_for_template: List[Message], prefill: str, answer_str: str, index: int
+    ) -> Tuple[List[int], List[int]]:
+        """Tokenizes prompt and answer, handling chat template and fallback."""
+        prompt_tokens = None
+
+        if self.use_chat_template:
+            try:
+                continue_message = bool(prefill)
+                prompt_tokens = self.tokenizer.apply_chat_template(
+                    messages_for_template,
+                    tokenize=True,
+                    add_generation_prompt=not continue_message,
+                    continue_final_message=prefill,
+                )
+            except Exception as e:
+                 # Replaced logger.warning
+                print(f"[Warning][Item {index}] Error applying chat template: {e}. Falling back to basic format.")
+                prompt_tokens = None # Trigger fallback
+
+        # Basic formatting fallback
+        if prompt_tokens is None:
+            prompt_text = ""
+            msgs_to_render = messages_for_template
+            if prefill and self.use_chat_template and msgs_to_render and msgs_to_render[-1].get("role") == "assistant" and msgs_to_render[-1].get("content") == prefill:
+                 msgs_to_render = messages_for_template[:-1]
+
+            for msg in msgs_to_render:
+                role = msg.get("role", "user").capitalize()
+                content = msg.get("content", "")
+                if role == "System":
+                    prompt_text += f"System: {content}\n"
+                else:
+                    prompt_text += f"{role}: {content}\n"
+
+            prompt_text += "Assistant:"
+            if prefill:
+                prompt_text += " " + prefill
+            prompt_tokens = self.tokenizer.encode(prompt_text)
+
+        # Encode Answer
+        answer_tokens = self.tokenizer.encode(answer_str, add_special_tokens=False)
+
+        if not prompt_tokens:
+            # This error should ideally be caught by the caller (_process_single_item)
+            # but raising it here ensures it's handled if called directly.
+            raise ValueError("Failed to produce prompt tokens.")
+
+        return prompt_tokens, answer_tokens
 
     def __len__(self) -> int:
-        return len(self._data)
+        """Return the number of successfully processed items."""
+        return len(self._processed_data)
 
-
+    def __getitem__(self, index: int) -> Tuple[List[int], List[int], str, str, str, str]:
+        """Returns the pre-processed item at the given index."""
+        return self._processed_data[index]
 def create_dataset(
     args,
     data,
@@ -225,15 +468,33 @@ def create_dataset(
         if mask_prompt:
             raise ValueError("Prompt masking not supported for text dataset.")
         return TextDataset(data, tokenizer, text_key=text_feature)
-    elif prompt_feature and answer_feature in sample:
-        return GRPODataset(
-            data=data,
-            tokenizer=tokenizer,
-            prompt_key="prompt",
-            answer_key="answer",
-            use_chat_template=args.use_chat_template,
-            use_prompt=args.use_prompt
-        )
+    elif prompt_feature in sample and answer_feature in sample:
+        # Check if we're dealing with GRPO-specific arguments
+        prompt_key = getattr(args, "prompt_key", prompt_feature)
+        answer_key = getattr(args, "answer_key", answer_feature)
+        messages_key = getattr(args, "messages_key", chat_feature)
+        
+        is_grpo_prompt_answer = prompt_key in sample and answer_key in sample
+        is_grpo_messages = messages_key in sample and isinstance(sample[messages_key], list)
+        
+        if is_grpo_prompt_answer or is_grpo_messages:
+            return GRPODataset(
+                data=data,
+                tokenizer=tokenizer,
+                prompt_key=prompt_key,
+                answer_key=answer_key,
+                messages_key=messages_key,
+                system_prompt_key=getattr(args, "system_prompt_key", None),
+                # System prompt handling
+                forced_system_prompt=getattr(args, "system_prompt", None),
+                default_system_prompt_arg=getattr(args, "default_system_prompt", None),
+                # Template and prefill handling
+                use_chat_template=getattr(args, "use_chat_template", True),
+                forced_assistant_prefill=getattr(args, "assistant_prefill", None),
+                default_assistant_prefill_arg=getattr(args, "default_assistant_prefill", None),
+                # System prompt compression for models like Gemma
+                compress_system_to_user=getattr(args, "compress_system_to_user", False)
+            )
     else:
         raise ValueError(
             "Unsupported data format, check the supported formats here:\n"

@@ -5,7 +5,6 @@ except ImportError:
 
 
 class TrainingCallback:
-
     def on_train_loss_report(self, train_info: dict):
         """Called to report training loss at specified intervals."""
         pass
@@ -13,10 +12,10 @@ class TrainingCallback:
     def on_val_loss_report(self, val_info: dict):
         """Called to report validation loss at specified intervals or the beginning."""
         pass
-        
+
     def on_validation_end(self, val_info: dict, val_samples: dict = None):
         """Called after validation with both metrics and sample data for rich reporting.
-        
+
         Args:
             val_info: Dictionary with validation metrics
             val_samples: Dictionary with sample data for visualization (prompts, completions, etc.)
@@ -26,14 +25,16 @@ class TrainingCallback:
 
 
 class WandBCallback(TrainingCallback):
-    def __init__(self, 
-                 project_name: str, 
-                 log_dir: str, 
-                 config: dict, 
-                 group_name: str = None,
-                 wrapped_callback: TrainingCallback = None):
+    def __init__(
+        self,
+        project_name: str,
+        log_dir: str,
+        config: dict,
+        group_name: str = None,
+        wrapped_callback: TrainingCallback = None,
+    ):
         """Initialize WandB callback.
-        
+
         Args:
             project_name: WandB project name
             log_dir: Directory for WandB logs
@@ -43,11 +44,11 @@ class WandBCallback(TrainingCallback):
         """
         if wandb is None:
             raise ImportError("wandb is not installed. Please install it to use WandBCallback.")
-            
+
         self.wrapped_callback = wrapped_callback
-        
+
         import mlx.core as mx
-        
+
         # Only log full config from rank 0 to avoid conflicts
         rank = 0
         try:
@@ -56,20 +57,20 @@ class WandBCallback(TrainingCallback):
         except:
             # Not in distributed mode
             log_config = config
-        
+
         wandb.init(
             project=project_name,
             dir=log_dir,
             config=log_config,
             group=group_name,
         )
-        
+
         if rank == 0:
             print(f"WandB initialized with project: {project_name}, group: {group_name or 'None'}")
 
     def on_train_loss_report(self, train_info: dict):
         """Log training metrics with hierarchical structure.
-        
+
         Args:
             train_info: Dictionary with train metrics and system info
         """
@@ -101,7 +102,7 @@ class WandBCallback(TrainingCallback):
 
     def on_val_loss_report(self, val_info: dict):
         """Legacy method for validation reporting.
-        
+
         Args:
             val_info: Dictionary with validation metrics
         """
@@ -143,7 +144,7 @@ class WandBCallback(TrainingCallback):
             else:
                 # Legacy format - convert flat dict to hierarchical
                 log_data = {f"val/{k}": v for k, v in val_info.items() if k != "validation_samples"}
-                
+
             # Process sample data if available
             if val_samples and wandb:
                 try:
@@ -161,9 +162,19 @@ class WandBCallback(TrainingCallback):
                             val_samples["rewards"][i].item() if "rewards" in val_samples else 0.0
                         ])
                     
-                    # Create and add table
+                    # Create and add tables with simplified paths
+                    # Main comprehensive table with everything
                     table = wandb.Table(columns=columns, data=data)
-                    log_data["validation/samples"] = table
+                    log_data["samples/all"] = table
+                    
+                    # Special table for top K best samples only (easier to review)
+                    if len(data) > 0:
+                        # Sort data by reward score (descending)
+                        sorted_data = sorted(data, key=lambda x: x[3], reverse=True)
+                        # Take top 3 samples
+                        best_data = sorted_data[:3]
+                        best_table = wandb.Table(columns=columns, data=best_data)
+                        log_data["samples/best"] = best_table
                     
                     # Add histogram of rewards if available
                     if "rewards" in val_samples:

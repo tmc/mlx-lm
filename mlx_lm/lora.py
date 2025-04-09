@@ -10,14 +10,13 @@ from pathlib import Path
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
-import mlx.nn as nn
 import numpy as np
 import yaml
 
 from .tokenizer_utils import TokenizerWrapper
 from .tuner.datasets import load_dataset
 from .tuner.trainer import TrainingArgs, TrainingCallback, evaluate, train
-from .tuner.grpo_trainer import GRPOTrainingArgs, evaluate_grpo, train_grpo
+from .tuner.grpo_trainer import GRPOTrainingArgs, train_grpo
 from .tuner.callbacks import WandBCallback
 from .tuner.utils import (
     build_schedule,
@@ -74,17 +73,29 @@ CONFIG_DEFAULTS = {
     "lora_parameters": {"rank": 8, "dropout": 0.0, "scale": 10.0},
     "mask_prompt": False,
     "wandb_project": None,
-
-    # GRPO args
+    # GRPO args - Generation settings
     "reference_model_path": None,
     "group_size": 4,
     "beta": 0.1,
     "epsilon": 1e-4,
     "max_completion_length": 512,
-    "use_chat_template": False,
-    "use_prompt": False,
     "temperature": 1.0,
-    "reward_weights": None
+    # GRPO args - Data keys
+    "prompt_key": "prompt",
+    "answer_key": "answer",
+    "messages_key": "messages",
+    "system_prompt_key": None,
+    # GRPO args - Prompting/Template settings
+    "system_prompt": None,  # Forced system prompt (overrides data)
+    "default_system_prompt": None,  # Default fallback system prompt
+    "assistant_prefill": None,  # Forced assistant prefill (overrides data)
+    "default_assistant_prefill": None,  # Default fallback assistant prefill
+    "use_chat_template": True,
+    "compress_system_to_user": False,  # For models that don't support system prompts (Gemma2)
+    "use_prompt": False,  # Legacy option
+    # GRPO args - Reward settings
+    "reward_weights": None,
+    "reward_functions_module": None,
 }
 
 
@@ -107,8 +118,7 @@ def build_parser():
         "--data",
         type=str,
         help=(
-            "Directory with {train, valid, test}.jsonl files or the name "
-            "of a Hugging Face dataset (e.g., 'mlx-community/wikisql')"
+            "Directory with {train, valid, test}.jsonl files or the name of a Hugging Face dataset (e.g., 'mlx-community/wikisql')"
         ),
     )
     parser.add_argument(
@@ -210,7 +220,7 @@ def build_parser():
     )
     parser.add_argument("--seed", type=int, help="The PRNG seed")
 
-    # GRPO args
+    # GRPO args - Generation settings
     parser.add_argument(
         "--group-size",
         type=int,
@@ -236,33 +246,107 @@ def build_parser():
         default=1e-4,
     )
     parser.add_argument(
-        "--use-chat-template",
-        action="store_true",
-        help="If the model is a Chat model, use the Chat template.",
-        default=None,
-    )
-    parser.add_argument(
-        "--use-prompt",
-        action="store_true",
-        help="Rather to use the prompt from the R1 paper.",
-        default=None,
-    )
-    parser.add_argument(
         "--temperature",
         type=float,
         help="Temperature for sampling. The higher the temperature, the more random the completions.",
         default=1.0,
     )
     parser.add_argument(
+        "--top-p",
+        type=float,
+        help="Top-p (nucleus) sampling. Keep tokens with cumulative probability < top_p. 1.0 disables this.",
+        default=1.0,
+    )
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        help="Top-k sampling. Keep only the top k tokens. -1 disables this.",
+        default=-1,
+    )
+
+    # GRPO args - Data keys
+    parser.add_argument(
+        "--prompt-key",
+        type=str,
+        help="Key for the user prompt in prompt/answer datasets.",
+        default="prompt",
+    )
+    parser.add_argument(
+        "--answer-key",
+        type=str,
+        help="Key for the target answer in prompt/answer datasets.",
+        default="answer",
+    )
+    parser.add_argument(
+        "--messages-key",
+        type=str,
+        help="Key for the messages list in chat datasets.",
+        default="messages",
+    )
+
+    # GRPO args - Prompting/Template settings
+    parser.add_argument(
+        "--system-prompt",
+        type=str,
+        help="System prompt text to FORCE using, overriding any system prompt found in the data.",
+        default=None,
+    )
+    parser.add_argument(
+        "--default-system-prompt",
+        type=str,
+        help="System prompt to use ONLY IF no system prompt is provided via --system-prompt AND none is found in the data.",
+        default=None,
+    )
+    parser.add_argument(
+        "--assistant-prefill",
+        type=str,
+        help="Text to FORCE prefilling the assistant's response start with, overriding any prefill from the data.",
+        default=None,
+    )
+    parser.add_argument(
+        "--default-assistant-prefill",
+        type=str,
+        help="Text to prefill the assistant's response start with ONLY IF the data does not end with an assistant message.",
+        default="<think>",
+    )
+    parser.add_argument(
+        "--use-chat-template",
+        action="store_true",
+        help="Use tokenizer's apply_chat_template if available. Highly recommended for chat data.",
+        default=None,
+    )
+    parser.add_argument(
+        "--compress-system-to-user",
+        action="store_true",
+        help="Compress system prompt into the first user message (for models that don't support system prompts, like Gemma).",
+        default=None,
+    )
+    parser.add_argument(
+        "--use-prompt",
+        action="store_true",
+        help="Legacy option to use prompt from R1 paper. Prefer --system-prompt instead.",
+        default=None,
+    )
+
+    # GRPO args - Reward settings
+    parser.add_argument(
         "--reward-weights",
         type=str,
         help="Weights for each reward function. Must match the number of reward functions and be in this format [0.1, 0.2, 0.3, 0.4, 0.5]. If not given, all rewards are weighted equally with weight `1.0`.",
         default=None,
     )
+    parser.add_argument(
+        "--reward_functions_module",
+        type=str,
+        help="Python module path to a file with reward functions. Module should export callables that match the RewardFunctions type signature.",
+        default=None,
+    )
     return parser
+
 
 def train_model_grpo(model, tokenizer, args, opt, train_set, valid_set, adapter_file, training_callback):
     training_args = GRPOTrainingArgs(
+        # Core training parameters
         batch_size=args.batch_size,
         iters=args.iters,
         val_batches=args.val_batches,
@@ -271,14 +355,28 @@ def train_model_grpo(model, tokenizer, args, opt, train_set, valid_set, adapter_
         steps_per_save=args.save_every,
         adapter_file=adapter_file,
         max_seq_length=args.max_seq_length,
-        max_completion_length=args.max_completion_length,
         grad_checkpoint=args.grad_checkpoint,
+        # GRPO-specific parameters
+        max_completion_length=args.max_completion_length,
         beta=args.beta,
         group_size=args.group_size,
         epsilon=args.epsilon,
         reference_model_path=args.reference_model_path,
         temperature=args.temperature,
-        reward_weights=[float(x) for x in args.reward_weights.strip('[]').split(',')] if args.reward_weights else None
+        reward_weights=[float(x) for x in args.reward_weights.strip("[]").split(",")] if args.reward_weights else None,
+        reward_functions_module=args.reward_functions_module,
+        # Data keys and system prompt parameters
+        prompt_key=getattr(args, "prompt_key", "prompt"),
+        answer_key=getattr(args, "answer_key", "answer"),
+        messages_key=getattr(args, "messages_key", "messages"),
+        system_prompt_key=getattr(args, "system_prompt_key", None),
+        # Templating parameters
+        system_prompt=getattr(args, "system_prompt", None),
+        default_system_prompt=getattr(args, "default_system_prompt", None),
+        assistant_prefill=getattr(args, "assistant_prefill", None),
+        default_assistant_prefill=getattr(args, "default_assistant_prefill", None),
+        use_chat_template=getattr(args, "use_chat_template", True),
+        compress_system_to_user=getattr(args, "compress_system_to_user", False),
     )
 
     if args.reference_model_path:
@@ -297,6 +395,7 @@ def train_model_grpo(model, tokenizer, args, opt, train_set, valid_set, adapter_
         training_callback=training_callback,
     )
 
+
 def train_model(
     args,
     model: nn.Module,
@@ -309,8 +408,7 @@ def train_model(
     model.freeze()
     if args.num_layers > len(model.layers):
         raise ValueError(
-            f"Requested to train {args.num_layers} layers "
-            f"but the model only has {len(model.layers)} layers."
+            f"Requested to train {args.num_layers} layers but the model only has {len(model.layers)} layers."
         )
 
     if args.fine_tune_type == "full":
@@ -378,7 +476,7 @@ def train_model(
             train_set,
             valid_set,
             adapter_file,
-            training_callback
+            training_callback,
         )
     else:
         train(
@@ -422,7 +520,7 @@ def run(args, training_callback: TrainingCallback = None):
             project_name=args.wandb_project,
             log_dir=args.adapter_path,
             config=vars(args),
-            wrapped_callback=training_callback
+            wrapped_callback=training_callback,
         )
 
     if args.test and not args.train:
@@ -465,7 +563,6 @@ def main():
 
 if __name__ == "__main__":
     print(
-        "Calling `python -m mlx_lm.lora...` directly is deprecated."
-        " Use `mlx_lm.lora...` or `python -m mlx_lm lora ...` instead."
+        "Calling `python -m mlx_lm.lora...` directly is deprecated. Use `mlx_lm.lora...` or `python -m mlx_lm lora ...` instead."
     )
     main()
